@@ -83,6 +83,22 @@ cdef inline void _init_parent_record(ParentInfo* record) noexcept nogil:
     record.lower_bound = -INFINITY
     record.upper_bound = INFINITY
 
+
+cdef inline void _reset_split_record(
+    SplitRecord* split,
+    intp_t end,
+) noexcept nogil:
+    split.feature = 0
+    split.pos = end
+    split.threshold = 0.0
+    split.improvement = -INFINITY
+    split.impurity_left = INFINITY
+    split.impurity_right = INFINITY
+    split.impurity_duration = INFINITY
+    split.missing_go_to_left = 0
+    split.n_missing = 0
+    split.split_time_index = -1
+
 # =============================================================================
 # TreeBuilder
 # =============================================================================
@@ -227,6 +243,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         false_roots = {}   # maps (parent_id, is_left) -> [count, depth, parent_time_index]
         X_copy = {}
         y_copy = {}
+        sample_weight_copy = {} if sample_weight is not None else None
         for i in range(X.shape[0]):
             # collect depths from the node paths
             depth_i = paths[i].indices.shape[0] - 1
@@ -250,33 +267,47 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                 false_roots[(parent_i, left)][0] += 1
                 X_copy[(parent_i, left)].append(X[i])
                 y_copy[(parent_i, left)].append(y[i])
+                if sample_weight_copy is not None:
+                    sample_weight_copy[(parent_i, left)].append(sample_weight[i])
             else:
-                # If the parent split is undefined, fall back to the root time index.
-                parent_feature = int(tree.feature[parent_i])
-                if self.feature_index_map is not None and parent_feature >= 0:
-                    parent_time_index = int(self.feature_index_map.get(parent_feature, 0))
-                else:
+                parent_time_index = int(tree.nodes[parent_i].split_time_index)
+                if parent_time_index < 0:
                     parent_time_index = 0
                 false_roots[(parent_i, left)] = [1, depth_i, parent_time_index]
                 X_copy[(parent_i, left)] = [X[i]]
                 y_copy[(parent_i, left)] = [y[i]]
+                if sample_weight_copy is not None:
+                    sample_weight_copy[(parent_i, left)] = [sample_weight[i]]
 
         X_list = []
         y_list = []
+        sample_weight_list = [] if sample_weight_copy is not None else None
 
         # reorder the samples according to parent node IDs
         for key, value in reversed(sorted(X_copy.items())):
             X_list = X_list + value
             y_list = y_list + y_copy[key]
+            if sample_weight_list is not None:
+                sample_weight_list = sample_weight_list + sample_weight_copy[key]
         cdef object X_new = np.array(X_list)
         cdef cnp.ndarray y_new = np.array(y_list)
+        cdef object sample_weight_new = None
+        if sample_weight_list is not None:
+            sample_weight_new = np.array(sample_weight_list, dtype=DOUBLE)
 
         # initialize the splitter using sorted samples
         cdef Splitter splitter = self.splitter
-        splitter.init(X_new, y_new, sample_weight, missing_values_in_feature_mask, self.threshold_gain, self.feature_index_map)
+        splitter.init(
+            X_new,
+            y_new,
+            sample_weight_new,
+            missing_values_in_feature_mask,
+            self.threshold_gain,
+            self.feature_index_map,
+        )
 
         # convert dict to numpy array and store value
-        self.initial_roots = np.array(list(false_roots.items()))
+        self.initial_roots = np.array(list(false_roots.items()), dtype=object)
 
     cpdef build(
         self,
@@ -429,6 +460,8 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
                 n_node_samples = end - start
                 splitter.node_reset(start, end, &weighted_n_node_samples)
+                _reset_split_record(split_ptr, end)
+                split = deref(split_ptr)
                 
                 # Always compute THIS node's impurity after resetting splitter to this node's samples
                 # (not just when first==1, because parent_record.impurity was set from stack_record.impurity
@@ -478,7 +511,11 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                         split.split_time_index = parent_time_index
                     else:
                         node_missing_count = split.n_missing
-                        duration_weight = splitter.criterion.weighted_n_missing
+                        if splitter.use_penalized_stop_gain:
+                            duration_weight = splitter.criterion.weighted_n_missing
+                        else:
+                            node_missing_count = 0
+                            duration_weight = 0.0
                         right_missing = 0
                         left_missing = 0
                         if split.missing_go_to_left:
@@ -718,6 +755,8 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
                 n_node_samples = end - start
                 splitter.node_reset(start, end, &weighted_n_node_samples)
+                _reset_split_record(split_ptr, end)
+                split = deref(split_ptr)
                 
                 # Always compute THIS node's impurity after resetting splitter to this node's samples
                 # (not just when first==1, because parent_record.impurity was set from stack_record.impurity
@@ -777,8 +816,12 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                                     f"Invalid split position during build: "
                                     f"start={start} end={end} pos={split.pos} depth={depth}"
                                 )
-                        node_missing_count = split.n_missing
-                        duration_weight = splitter.criterion.weighted_n_missing
+                        if splitter.use_penalized_stop_gain:
+                            node_missing_count = split.n_missing
+                            duration_weight = splitter.criterion.weighted_n_missing
+                        else:
+                            node_missing_count = 0
+                            duration_weight = 0.0
 
                         # If EPSILON=0 in the below comparison, float precision
                         # issues stop splitting, producing trees that are
@@ -1251,6 +1294,8 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         cdef float64_t node_impurity_value = 0
 
         splitter.node_reset(start, end, &weighted_n_node_samples)
+        _reset_split_record(split_ptr, end)
+        split = deref(split_ptr)
 
         # reset n_constant_features for this specific split before beginning split search
         parent_record.n_constant_features = 0
@@ -1295,8 +1340,12 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                             f"Invalid split position (best-first): "
                             f"start={start} end={end} pos={split.pos} depth={depth}"
                         )
-                node_missing_count = split.n_missing
-                duration_weight = splitter.criterion.weighted_n_missing
+                if splitter.use_penalized_stop_gain:
+                    node_missing_count = split.n_missing
+                    duration_weight = splitter.criterion.weighted_n_missing
+                else:
+                    node_missing_count = 0
+                    duration_weight = 0.0
                 right_missing = 0
                 left_missing = 0
                 if split.missing_go_to_left:
@@ -2630,15 +2679,43 @@ def _check_node_ndarray(node_ndarray, expected_dtype):
     if node_ndarray_dtype == expected_dtype:
         return node_ndarray
 
-    node_ndarray_dtype_dict = _dtype_to_dict(node_ndarray_dtype)
-    all_compatible_dtype_dicts = _all_compatible_dtype_dicts(expected_dtype)
-
-    if node_ndarray_dtype_dict not in all_compatible_dtype_dicts:
+    if node_ndarray_dtype.names != expected_dtype.names:
         raise ValueError(
             "node array from the pickle has an incompatible dtype:\n"
             f"- expected: {expected_dtype}\n"
             f"- got     : {node_ndarray_dtype}"
         )
+
+    indexing_field_names = {
+        "left_child",
+        "right_child",
+        "feature",
+        "n_node_samples",
+        "split_time_index",
+        "n_duration_samples",
+    }
+    for field_name in expected_dtype.names:
+        actual_field_dtype = node_ndarray_dtype.fields[field_name][0]
+        expected_field_dtype = expected_dtype.fields[field_name][0]
+
+        if field_name in indexing_field_names:
+            if actual_field_dtype.kind != "i" or actual_field_dtype.itemsize not in (4, 8):
+                raise ValueError(
+                    "node array from the pickle has an incompatible dtype:\n"
+                    f"- expected: {expected_dtype}\n"
+                    f"- got     : {node_ndarray_dtype}"
+                )
+            continue
+
+        if (
+            actual_field_dtype.kind != expected_field_dtype.kind
+            or actual_field_dtype.itemsize != expected_field_dtype.itemsize
+        ):
+            raise ValueError(
+                "node array from the pickle has an incompatible dtype:\n"
+                f"- expected: {expected_dtype}\n"
+                f"- got     : {node_ndarray_dtype}"
+            )
 
     return node_ndarray.astype(expected_dtype, casting="same_kind")
 

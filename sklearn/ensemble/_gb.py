@@ -366,7 +366,6 @@ class BaseGradientBoosting(BaseEnsemble, metaclass=ABCMeta):
         "tol": [Interval(Real, 0.0, None, closed="left")],
     }
     _parameter_constraints.pop("store_leaf_values")
-    _parameter_constraints.pop("splitter")
     _parameter_constraints.pop("monotonic_cst")
 
     @abstractmethod
@@ -2059,6 +2058,9 @@ class GradientBoostingRegressor(RegressorMixin, BaseGradientBoosting):
         "init": [StrOptions({"zero"}), None, HasMethods(["fit", "predict"])],
         "alpha": [Interval(Real, 0.0, 1.0, closed="neither")],
     }
+    _parameter_constraints.pop("splitter")
+    _parameter_constraints.pop("threshold_gain")
+    _parameter_constraints.pop("features_group")
 
     def __init__(
         self,

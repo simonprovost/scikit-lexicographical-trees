@@ -2080,7 +2080,8 @@ class RandomForestClassifier(ForestClassifier):
             None,
         ],
     }
-    _parameter_constraints.pop("splitter")
+    for param in ("splitter", "threshold_gain", "features_group"):
+        _parameter_constraints.pop(param)
 
     def __init__(
         self,
@@ -2457,7 +2458,8 @@ class RandomForestRegressor(ForestRegressor):
         **ForestRegressor._parameter_constraints,
         **DecisionTreeRegressor._parameter_constraints,
     }
-    _parameter_constraints.pop("splitter")
+    for param in ("splitter", "threshold_gain", "features_group"):
+        _parameter_constraints.pop(param)
 
     def __init__(
         self,
@@ -2841,7 +2843,8 @@ class ExtraTreesClassifier(ForestClassifier):
             None,
         ],
     }
-    _parameter_constraints.pop("splitter")
+    for param in ("splitter", "threshold_gain", "features_group"):
+        _parameter_constraints.pop(param)
 
     def __init__(
         self,
@@ -3196,7 +3199,8 @@ class ExtraTreesRegressor(ForestRegressor):
         **ForestRegressor._parameter_constraints,
         **DecisionTreeRegressor._parameter_constraints,
     }
-    _parameter_constraints.pop("splitter")
+    for param in ("splitter", "threshold_gain", "features_group"):
+        _parameter_constraints.pop(param)
 
     def __init__(
         self,
@@ -3454,7 +3458,14 @@ class RandomTreesEmbedding(TransformerMixin, BaseForest):
         **BaseDecisionTree._parameter_constraints,
         "sparse_output": ["boolean"],
     }
-    for param in ("max_features", "ccp_alpha", "splitter", "monotonic_cst"):
+    for param in (
+        "max_features",
+        "ccp_alpha",
+        "splitter",
+        "monotonic_cst",
+        "threshold_gain",
+        "features_group",
+    ):
         _parameter_constraints.pop(param)
 
     criterion = "squared_error"
