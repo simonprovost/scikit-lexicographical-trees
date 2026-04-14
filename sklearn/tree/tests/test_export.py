@@ -523,6 +523,11 @@ def test_plot_tree_standard_tree_not_detected_as_tpt(pyplot):
     assert not exporter._is_tpt_tree(clf)
 
 
+def test_plot_tree_tpt_tree_detected_as_tpt(pyplot):
+    clf = DecisionTreeClassifier(splitter="TpT", random_state=2)
+    exporter = _MPLTreeExporter()
+
+    assert exporter._is_tpt_tree(clf)
 @pytest.mark.parametrize("fontsize", [None, 10, 20])
 def test_plot_tree_gini(pyplot, fontsize):
     # mostly smoke tests
