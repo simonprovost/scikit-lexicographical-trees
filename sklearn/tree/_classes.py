@@ -8,11 +8,10 @@ randomized trees. Single and multi-output problems are both handled.
 
 import copy
 import numbers
+import numpy as np
 from abc import ABCMeta, abstractmethod
 from math import ceil
 from numbers import Integral, Real
-
-import numpy as np
 from scipy.sparse import issparse
 
 from sklearn.base import (
@@ -36,11 +35,9 @@ from sklearn.utils.validation import (
     assert_all_finite,
     check_is_fitted,
 )
-
 from . import _criterion, _splitter, _tree
 from ._criterion import BaseCriterion
 from ._splitter import BaseSplitter
-from ._splitter import LexicoRFSplitter
 from ._tree import (
     BestFirstTreeBuilder,
     DepthFirstTreeBuilder,
@@ -80,7 +77,8 @@ CRITERIA_REG = {
 DENSE_SPLITTERS = {
     "best": _splitter.BestSplitter,
     "random": _splitter.RandomSplitter,
-    "lexicoRF": _splitter.LexicoRFSplitter
+    "lexicoRF": _splitter.LexicoRFSplitter,
+    "TpT": _splitter.TpTSplitter
 }
 
 SPARSE_SPLITTERS = {
@@ -101,7 +99,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
     """
 
     _parameter_constraints: dict = {
-        "splitter": [StrOptions({"best", "random", "lexicoRF"})],
+        "splitter": [StrOptions({"best", "random", "lexicoRF", "TpT"})],
         "max_depth": [Interval(Integral, 1, None, closed="left"), None],
         "min_samples_split": [
             Interval(Integral, 2, None, closed="left"),
@@ -1545,7 +1543,7 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
     def _more_tags(self):
         # XXX: nan is only support for dense arrays, but we set this for common test to
         # pass, specifically: check_estimators_nan_inf
-        allow_nan = self.splitter == "best" and self.criterion in {
+        allow_nan = self.splitter in {"best", "TpT"} and self.criterion in {
             "gini",
             "log_loss",
             "entropy",
@@ -1915,7 +1913,7 @@ class DecisionTreeRegressor(RegressorMixin, BaseDecisionTree):
     def _more_tags(self):
         # XXX: nan is only support for dense arrays, but we set this for common test to
         # pass, specifically: check_estimators_nan_inf
-        allow_nan = self.splitter == "best" and self.criterion in {
+        allow_nan = self.splitter in {"best", "TpT"} and self.criterion in {
             "squared_error",
             "friedman_mse",
             "poisson",

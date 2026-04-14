@@ -21,6 +21,7 @@ cdef class BaseCriterion:
     cdef intp_t n_samples                  # Number of samples
     cdef intp_t n_node_samples             # Number of samples in the node (end-start)
     cdef float64_t weighted_n_samples         # Weighted number of samples (in total)
+    cdef float64_t weighted_n_subjects        # Weighted number of subjects (for TpT normalization)
     cdef float64_t weighted_n_node_samples    # Weighted number of samples in the node
     cdef float64_t weighted_n_left            # Weighted number of samples in the left node
     cdef float64_t weighted_n_right           # Weighted number of samples in the right node
@@ -44,6 +45,10 @@ cdef class BaseCriterion:
         self,
         float64_t* dest
     ) noexcept nogil
+    cdef void node_duration_value(
+        self,
+        float64_t* dest
+    ) noexcept nogil
     cdef float64_t impurity_improvement(
         self,
         float64_t impurity_parent,
@@ -56,6 +61,7 @@ cdef class BaseCriterion:
         intp_t start,
         intp_t end
     ) noexcept nogil
+    cdef void set_weighted_n_subjects(self, float64_t weighted_n_subjects) noexcept nogil
 
 
 cdef class Criterion(BaseCriterion):
@@ -101,6 +107,28 @@ cdef class Criterion(BaseCriterion):
         self,
         vector[vector[float64_t]]& dest
     ) noexcept nogil
+
+    cdef inline void tpt_effective_child_weights(
+        self,
+        float64_t* weighted_left,
+        float64_t* weighted_right,
+    ) noexcept nogil
+
+    cdef void node_duration_value(
+        self,
+        float64_t* dest
+    ) noexcept nogil
+
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil
+    cdef float64_t impurity_improvement_ternary(self,
+                                                float64_t impurity_parent,
+                                                float64_t impurity_left,
+                                                float64_t impurity_right,
+                                                float64_t impurity_duration) noexcept nogil
+    cdef float64_t proxy_impurity_improvement_ternary(self) noexcept nogil
 
 cdef class ClassificationCriterion(Criterion):
     """Abstract criterion for classification."""

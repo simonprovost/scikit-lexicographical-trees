@@ -114,6 +114,10 @@ cdef class BaseCriterion:
         """
         pass
 
+    cdef void node_duration_value(self, float64_t* dest) noexcept nogil:
+        """Placeholder for storing the duration-branch value."""
+        pass
+
     cdef float64_t proxy_impurity_improvement(self) noexcept nogil:
         """Compute a proxy of the impurity reduction.
 
@@ -143,9 +147,12 @@ cdef class BaseCriterion:
             N_t / N * (impurity - N_t_R / N_t * right_impurity
                                 - N_t_L / N_t * left_impurity)
 
-        where N is the total number of samples, N_t is the number of samples
+        where N is the total number of samples (or subjects for TpT), N_t is the number of samples
         at the current node, N_t_L is the number of samples in the left child,
         and N_t_R is the number of samples in the right child,
+
+        For Time-penalized Trees (TpT), when weighted_n_subjects > 0, we normalize by the
+        number of subjects instead of observations to match the expected behavior.
 
         Parameters
         ----------
@@ -162,7 +169,10 @@ cdef class BaseCriterion:
         ------
         float64_t : improvement in impurity after the split occurs
         """
-        return ((self.weighted_n_node_samples / self.weighted_n_samples) *
+        # For TpT: use weighted_n_subjects if set, otherwise use weighted_n_samples
+        cdef float64_t normalization_factor = self.weighted_n_subjects if self.weighted_n_subjects > 0 else self.weighted_n_samples
+
+        return ((self.weighted_n_node_samples / normalization_factor) *
                 (impurity_parent - (self.weighted_n_right /
                                     self.weighted_n_node_samples * impurity_right)
                                  - (self.weighted_n_left /
@@ -188,6 +198,19 @@ cdef class BaseCriterion:
             The last sample used on this node
         """
         pass
+
+    cdef void set_weighted_n_subjects(self, float64_t weighted_n_subjects) noexcept nogil:
+        """Set the weighted number of subjects for TpT normalization.
+
+        When set to a value > 0, impurity_improvement will normalize by the number of subjects
+        instead of the number of observations, which is required for Time-penalized Trees (TpT).
+
+        Parameters
+        ----------
+        weighted_n_subjects : float64_t
+            The total weighted number of subjects (> 0 to enable TpT mode, 0 to disable)
+        """
+        self.weighted_n_subjects = weighted_n_subjects
 
 
 cdef class Criterion(BaseCriterion):
@@ -290,6 +313,29 @@ cdef class Criterion(BaseCriterion):
     cdef void init_sum_missing(self):
         """Init sum_missing to hold sums for missing values."""
 
+    cdef inline void tpt_effective_child_weights(
+        self,
+        float64_t* weighted_left,
+        float64_t* weighted_right,
+    ) noexcept nogil:
+        """Compute effective child weights excluding TpT duration (missing) mass."""
+        cdef float64_t w_left = self.weighted_n_left
+        cdef float64_t w_right = self.weighted_n_right
+
+        if self.n_missing != 0 and self.weighted_n_missing > 0.0:
+            if self.missing_go_to_left:
+                w_left -= self.weighted_n_missing
+            else:
+                w_right -= self.weighted_n_missing
+
+        if w_left < 0.0:
+            w_left = 0.0
+        if w_right < 0.0:
+            w_right = 0.0
+
+        weighted_left[0] = w_left
+        weighted_right[0] = w_right
+
     cdef void node_samples(
         self,
         vector[vector[float64_t]]& dest
@@ -315,6 +361,69 @@ cdef class Criterion(BaseCriterion):
             # Get the sample values for each output
             for k in range(self.n_outputs):
                 dest[i].push_back(self.y[j, k])
+
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil:
+        """
+        Default ternary impurity: compute left/right via binary path and
+        set duration impurity to 0 when no specialized override exists.
+        """
+        cdef float64_t il, ir
+        self.children_impurity(&il, &ir)
+        impurity_left[0] = il
+        impurity_right[0] = ir
+        # default to neutral duration impurity for criteria that don't override
+        impurity_duration[0] = 0.0
+
+    cdef float64_t impurity_improvement_ternary(self,
+                                                float64_t impurity_parent,
+                                                float64_t impurity_left,
+                                                float64_t impurity_right,
+                                                float64_t impurity_duration) noexcept nogil:
+        """
+        Ternary improvement: subtract duration impurity as a third branch.
+        Mirrors weighting used in binary impurity_improvement.
+        """
+        cdef float64_t normalization_factor = self.weighted_n_subjects if self.weighted_n_subjects > 0 else self.weighted_n_samples
+        cdef float64_t duration_term = 0.0
+        cdef float64_t weighted_left_eff
+        cdef float64_t weighted_right_eff
+        self.tpt_effective_child_weights(&weighted_left_eff, &weighted_right_eff)
+
+        if self.weighted_n_missing > 0.0 and self.weighted_n_node_samples > 0.0:
+            duration_term = (self.weighted_n_missing / self.weighted_n_node_samples) * impurity_duration
+
+        return ((self.weighted_n_node_samples / normalization_factor) *
+                (impurity_parent
+                 - (weighted_right_eff / self.weighted_n_node_samples * impurity_right)
+                 - (weighted_left_eff / self.weighted_n_node_samples * impurity_left)
+                 - duration_term))
+
+    cdef float64_t proxy_impurity_improvement_ternary(self) noexcept nogil:
+        """
+        Placeholder ternary proxy: same as binary proxy for now.
+        """
+        cdef float64_t impurity_left
+        cdef float64_t impurity_right
+        cdef float64_t impurity_duration
+        cdef float64_t weighted_left_eff
+        cdef float64_t weighted_right_eff
+        cdef float64_t duration_component = 0.0
+
+        self.children_impurity_three(&impurity_left, &impurity_right, &impurity_duration)
+        self.tpt_effective_child_weights(&weighted_left_eff, &weighted_right_eff)
+
+        if self.weighted_n_missing > 0.0:
+            if impurity_duration != impurity_duration:
+                impurity_duration = 0.0
+            elif impurity_duration < INFINITY:
+                duration_component = self.weighted_n_missing * impurity_duration
+
+        return (-weighted_right_eff * impurity_right
+                - weighted_left_eff * impurity_left
+                - duration_component)
 
 
 cdef inline void _move_sums_classification(
@@ -438,6 +547,7 @@ cdef class ClassificationCriterion(Criterion):
         self.sample_weight = sample_weight
         self.sample_indices = sample_indices
         self.weighted_n_samples = weighted_n_samples
+        self.weighted_n_subjects = 0.0  # Default: use weighted_n_samples unless explicitly set
 
         return 0
 
@@ -495,6 +605,7 @@ cdef class ClassificationCriterion(Criterion):
 
         self.n_missing = n_missing
         if n_missing == 0:
+            self.weighted_n_missing = 0.0
             return
 
         memset(&self.sum_missing[0, 0], 0, self.max_n_classes * self.n_outputs * sizeof(float64_t))
@@ -638,6 +749,22 @@ cdef class ClassificationCriterion(Criterion):
                 dest[c] = self.sum_total[k, c] / self.weighted_n_node_samples
             dest += self.max_n_classes
 
+    cdef void node_duration_value(self, float64_t* dest) noexcept nogil:
+        cdef intp_t k, c
+        if self.weighted_n_missing <= 0.0:
+            for k in range(self.n_outputs):
+                for c in range(self.max_n_classes):
+                    dest[c] = 0.0
+                dest += self.max_n_classes
+            return
+
+        for k in range(self.n_outputs):
+            for c in range(self.n_classes[k]):
+                dest[c] = self.sum_missing[k, c] / self.weighted_n_missing
+            for c in range(self.n_classes[k], self.max_n_classes):
+                dest[c] = 0.0
+            dest += self.max_n_classes
+
     cdef inline void clip_node_value(
         self, float64_t * dest, float64_t lower_bound, float64_t upper_bound
     ) noexcept nogil:
@@ -754,6 +881,69 @@ cdef class Entropy(ClassificationCriterion):
         impurity_left[0] = entropy_left / self.n_outputs
         impurity_right[0] = entropy_right / self.n_outputs
 
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil:
+        """Evaluate ternary impurity (left, right, duration=missing bucket)."""
+        cdef float64_t entropy_left = 0.0
+        cdef float64_t entropy_right = 0.0
+        cdef float64_t entropy_missing = 0.0
+        cdef float64_t w_left_eff
+        cdef float64_t w_right_eff
+        cdef float64_t count_k
+        cdef intp_t k, c
+        cdef bint has_missing = self.n_missing != 0 and self.weighted_n_missing > 0.0
+        cdef bint missing_left = has_missing and self.missing_go_to_left
+        cdef bint missing_right = has_missing and not self.missing_go_to_left
+
+        self.tpt_effective_child_weights(&w_left_eff, &w_right_eff)
+
+        if w_left_eff > 0.0:
+            for k in range(self.n_outputs):
+                for c in range(self.n_classes[k]):
+                    count_k = self.sum_left[k, c]
+                    if missing_left:
+                        count_k -= self.sum_missing[k, c]
+                    if count_k <= 0.0:
+                        continue
+                    count_k /= w_left_eff
+                    entropy_left -= count_k * log(count_k)
+            entropy_left /= self.n_outputs
+        else:
+            entropy_left = 0.0
+
+        if w_right_eff > 0.0:
+            for k in range(self.n_outputs):
+                for c in range(self.n_classes[k]):
+                    count_k = self.sum_right[k, c]
+                    if missing_right:
+                        count_k -= self.sum_missing[k, c]
+                    if count_k <= 0.0:
+                        continue
+                    count_k /= w_right_eff
+                    entropy_right -= count_k * log(count_k)
+            entropy_right /= self.n_outputs
+        else:
+            entropy_right = 0.0
+
+        impurity_left[0] = entropy_left
+        impurity_right[0] = entropy_right
+
+        if not has_missing or self.weighted_n_missing <= 0.0:
+            impurity_duration[0] = 0
+            return
+
+        for k in range(self.n_outputs):
+            for c in range(self.n_classes[k]):
+                count_k = self.sum_missing[k, c]
+                if count_k <= 0.0:
+                    continue
+                count_k /= self.weighted_n_missing
+                entropy_missing -= count_k * log(count_k)
+
+        impurity_duration[0] = entropy_missing / self.n_outputs
+
 
 cdef class Gini(ClassificationCriterion):
     r"""Gini Index impurity criterion.
@@ -835,6 +1025,73 @@ cdef class Gini(ClassificationCriterion):
 
         impurity_left[0] = gini_left / self.n_outputs
         impurity_right[0] = gini_right / self.n_outputs
+
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil:
+        """Evaluate ternary impurity (left, right, duration=missing bucket)."""
+        cdef float64_t gini_left = 0.0
+        cdef float64_t gini_right = 0.0
+        cdef float64_t gini_missing = 0.0
+        cdef float64_t w_left_eff
+        cdef float64_t w_right_eff
+        cdef float64_t count_k
+        cdef float64_t sq_count
+        cdef intp_t k, c
+        cdef bint has_missing = self.n_missing != 0 and self.weighted_n_missing > 0.0
+        cdef bint missing_left = has_missing and self.missing_go_to_left
+        cdef bint missing_right = has_missing and not self.missing_go_to_left
+
+        self.tpt_effective_child_weights(&w_left_eff, &w_right_eff)
+
+        if w_left_eff > 0.0:
+            for k in range(self.n_outputs):
+                sq_count = 0.0
+                for c in range(self.n_classes[k]):
+                    count_k = self.sum_left[k, c]
+                    if missing_left:
+                        count_k -= self.sum_missing[k, c]
+                    if count_k <= 0.0:
+                        continue
+                    sq_count += count_k * count_k
+                gini_left += 1.0 - sq_count / (w_left_eff * w_left_eff)
+            gini_left /= self.n_outputs
+        else:
+            gini_left = 0.0
+
+        if w_right_eff > 0.0:
+            for k in range(self.n_outputs):
+                sq_count = 0.0
+                for c in range(self.n_classes[k]):
+                    count_k = self.sum_right[k, c]
+                    if missing_right:
+                        count_k -= self.sum_missing[k, c]
+                    if count_k <= 0.0:
+                        continue
+                    sq_count += count_k * count_k
+                gini_right += 1.0 - sq_count / (w_right_eff * w_right_eff)
+            gini_right /= self.n_outputs
+        else:
+            gini_right = 0.0
+
+        impurity_left[0] = gini_left
+        impurity_right[0] = gini_right
+
+        if not has_missing or self.weighted_n_missing <= 0.0:
+            impurity_duration[0] = 0
+            return
+
+        for k in range(self.n_outputs):
+            sq_count = 0.0
+            for c in range(self.n_classes[k]):
+                count_k = self.sum_missing[k, c]
+                if count_k <= 0.0:
+                    continue
+                sq_count += count_k * count_k
+            gini_missing += 1.0 - sq_count / (self.weighted_n_missing * self.weighted_n_missing)
+
+        impurity_duration[0] = gini_missing / self.n_outputs
 
 
 cdef inline void _move_sums_regression(
@@ -932,6 +1189,7 @@ cdef class RegressionCriterion(Criterion):
         self.sample_weight = sample_weight
         self.sample_indices = sample_indices
         self.weighted_n_samples = weighted_n_samples
+        self.weighted_n_subjects = 0.0  # Default: use weighted_n_samples unless explicitly set
 
         return 0
 
@@ -1106,6 +1364,16 @@ cdef class RegressionCriterion(Criterion):
         for k in range(self.n_outputs):
             dest[k] = self.sum_total[k] / self.weighted_n_node_samples
 
+    cdef void node_duration_value(self, float64_t* dest) noexcept nogil:
+        cdef intp_t k
+        if self.weighted_n_missing <= 0.0:
+            for k in range(self.n_outputs):
+                dest[k] = 0.0
+            return
+
+        for k in range(self.n_outputs):
+            dest[k] = self.sum_missing[k] / self.weighted_n_missing
+
     cdef inline void clip_node_value(self, float64_t* dest, float64_t lower_bound, float64_t upper_bound) noexcept nogil:
         """Clip the value in dest between lower_bound and upper_bound for monotonic constraints."""
         if dest[0] < lower_bound:
@@ -1252,6 +1520,42 @@ cdef class MSE(RegressionCriterion):
         impurity_left[0] /= self.n_outputs
         impurity_right[0] /= self.n_outputs
 
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil:
+        """Evaluate ternary impurity using missing bucket as duration impurity."""
+        cdef float64_t il, ir
+        self.children_impurity(&il, &ir)
+        impurity_left[0] = il
+        impurity_right[0] = ir
+
+        if self.n_missing == 0 or self.weighted_n_missing <= 0.0:
+            impurity_duration[0] = INFINITY
+            return
+
+        # Compute exact MSE impurity for missing bucket by a direct pass
+        cdef const float64_t[:] sample_weight = self.sample_weight
+        cdef const intp_t[:] sample_indices = self.sample_indices
+        cdef const float64_t[:, ::1] y = self.y
+
+        cdef intp_t start_miss = self.end - self.n_missing
+        cdef intp_t p, i, k
+        cdef float64_t w = 1.0
+        cdef float64_t sq_sum_missing = 0.0
+
+        for p in range(start_miss, self.end):
+            i = sample_indices[p]
+            if sample_weight is not None:
+                w = sample_weight[i]
+            for k in range(self.n_outputs):
+                sq_sum_missing += w * y[i, k] * y[i, k]
+
+        cdef float64_t imp_miss = sq_sum_missing / self.weighted_n_missing
+        for k in range(self.n_outputs):
+            imp_miss -= (self.sum_missing[k] / self.weighted_n_missing) ** 2.0
+        impurity_duration[0] = imp_miss / self.n_outputs
+
 
 cdef class MAE(RegressionCriterion):
     r"""Mean absolute error impurity criterion.
@@ -1317,6 +1621,7 @@ cdef class MAE(RegressionCriterion):
         self.sample_weight = sample_weight
         self.sample_indices = sample_indices
         self.weighted_n_samples = weighted_n_samples
+        self.weighted_n_subjects = 0.0  # Default: use weighted_n_samples unless explicitly set
 
         return 0
 
@@ -1587,6 +1892,22 @@ cdef class MAE(RegressionCriterion):
         p_impurity_right[0] = impurity_right / (self.weighted_n_right *
                                                 self.n_outputs)
 
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil:
+        cdef float64_t il, ir
+        self.children_impurity(&il, &ir)
+        impurity_left[0] = il
+        impurity_right[0] = ir
+
+        if self.n_missing == 0 or self.weighted_n_missing <= 0.0:
+            impurity_duration[0] = INFINITY
+            return
+
+        # MAE duration impurity not defined yet; treat as neutral.
+        impurity_duration[0] = 0.0
+
 
 cdef class FriedmanMSE(MSE):
     """Mean squared error impurity criterion with improvement score by Friedman.
@@ -1737,6 +2058,78 @@ cdef class Poisson(RegressionCriterion):
 
         impurity_right[0] = self.poisson_loss(pos, end, self.sum_right,
                                               self.weighted_n_right)
+
+    cdef void children_impurity_three(self,
+                                      float64_t* impurity_left,
+                                      float64_t* impurity_right,
+                                      float64_t* impurity_duration) noexcept nogil:
+        cdef float64_t w_left_eff
+        cdef float64_t w_right_eff
+        cdef float64_t imp_left = 0.0
+        cdef float64_t imp_right = 0.0
+        cdef float64_t original_left = self.weighted_n_left
+        cdef float64_t original_right = self.weighted_n_right
+        cdef intp_t k
+        cdef intp_t end_non_missing = self.end - self.n_missing
+        cdef bint has_missing = self.n_missing != 0 and self.weighted_n_missing > 0.0
+        cdef bint missing_left = has_missing and self.missing_go_to_left
+        cdef bint missing_right = has_missing and not self.missing_go_to_left
+
+        self.tpt_effective_child_weights(&w_left_eff, &w_right_eff)
+
+        if missing_left and w_left_eff > 0.0:
+            for k in range(self.n_outputs):
+                self.sum_left[k] -= self.sum_missing[k]
+            self.weighted_n_left = w_left_eff
+
+        if missing_right and w_right_eff > 0.0:
+            for k in range(self.n_outputs):
+                self.sum_right[k] -= self.sum_missing[k]
+            self.weighted_n_right = w_right_eff
+
+        if w_left_eff > 0.0:
+            imp_left = self.poisson_loss(
+                self.start,
+                self.pos,
+                self.sum_left,
+                self.weighted_n_left,
+            )
+        else:
+            imp_left = 0.0
+
+        if w_right_eff > 0.0:
+            imp_right = self.poisson_loss(
+                self.pos,
+                end_non_missing,
+                self.sum_right,
+                self.weighted_n_right,
+            )
+        else:
+            imp_right = 0.0
+
+        if missing_left and w_left_eff > 0.0:
+            for k in range(self.n_outputs):
+                self.sum_left[k] += self.sum_missing[k]
+        if missing_right and w_right_eff > 0.0:
+            for k in range(self.n_outputs):
+                self.sum_right[k] += self.sum_missing[k]
+
+        self.weighted_n_left = original_left
+        self.weighted_n_right = original_right
+
+        impurity_left[0] = imp_left
+        impurity_right[0] = imp_right
+
+        if not has_missing or self.weighted_n_missing <= 0.0:
+            impurity_duration[0] = 0
+            return
+
+        impurity_duration[0] = self.poisson_loss(
+            end_non_missing,
+            self.end,
+            self.sum_missing,
+            self.weighted_n_missing,
+        )
 
     cdef inline float64_t poisson_loss(
         self,

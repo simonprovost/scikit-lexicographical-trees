@@ -53,6 +53,8 @@ cdef inline cnp.ndarray sizet_ptr_to_ndarray(intp_t* data, intp_t size):
 cdef inline intp_t rand_int(intp_t low, intp_t high,
                             uint32_t* random_state) noexcept nogil:
     """Generate a random integer in [low; end)."""
+    if high <= low:
+        return low
     return low + our_rand_r(random_state) % (high - low)
 
 
@@ -450,12 +452,18 @@ def _any_isnan_axis0(const float32_t[:, :] X):
         intp_t n_features = X.shape[1]
         unsigned char[::1] isnan_out = np.zeros(X.shape[1], dtype=np.bool_)
 
+    cdef intp_t n_unflagged = n_features
+
     with nogil:
         for i in range(n_samples):
+            if n_unflagged == 0:
+                break
             for j in range(n_features):
                 if isnan_out[j]:
                     continue
                 if isnan(X[i, j]):
                     isnan_out[j] = True
-                    break
+                    n_unflagged -= 1
+                    if n_unflagged == 0:
+                        break
     return np.asarray(isnan_out)

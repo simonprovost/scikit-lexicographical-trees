@@ -5,8 +5,9 @@ from cpython cimport Py_INCREF, PyObject, PyTypeObject
 from cython.operator cimport dereference as deref
 from libc.math cimport isnan
 from libc.stdint cimport INTPTR_MAX
-from libc.stdlib cimport free, malloc
+from libc.stdlib cimport free, malloc, getenv
 from libc.string cimport memcpy, memset
+from libc.stdio cimport printf
 from libcpp.vector cimport vector
 from libcpp.stack cimport stack
 from libcpp cimport bool
@@ -55,6 +56,19 @@ TREE_LEAF = -1
 TREE_UNDEFINED = -2
 cdef intp_t _TREE_LEAF = TREE_LEAF
 cdef intp_t _TREE_UNDEFINED = TREE_UNDEFINED
+
+cdef inline bint _tpt_debug_env_enabled():
+    """Return True when SCIKIT_TPT_DEBUG env var is set to a non-empty, non-zero value."""
+    cdef char* env = getenv("SCIKIT_TPT_DEBUG")
+    if env == NULL:
+        return False
+    if env[0] == '\0':
+        return False
+    if env[0] == '0' and env[1] == '\0':
+        return False
+    return True
+
+cdef bint TPT_DEBUG_ENABLED = _tpt_debug_env_enabled()
 
 # Build the corresponding numpy dtype for Node.
 # This works by casting `dummy` to an array of Node of length 1, which numpy
@@ -150,6 +164,7 @@ cdef struct StackRecord:
     intp_t n_constant_features
     float64_t lower_bound
     float64_t upper_bound
+    intp_t time_index  # Parent split-time index inherited by this node.
 
 
 cdef class DepthFirstTreeBuilder(TreeBuilder):
@@ -209,7 +224,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         cdef intp_t PARENT
         cdef intp_t CHILD
         cdef intp_t i
-        false_roots = {}
+        false_roots = {}   # maps (parent_id, is_left) -> [count, depth, parent_time_index]
         X_copy = {}
         y_copy = {}
         for i in range(X.shape[0]):
@@ -236,7 +251,13 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                 X_copy[(parent_i, left)].append(X[i])
                 y_copy[(parent_i, left)].append(y[i])
             else:
-                false_roots[(parent_i, left)] = [1, depth_i]
+                # If the parent split is undefined, fall back to the root time index.
+                parent_feature = int(tree.feature[parent_i])
+                if self.feature_index_map is not None and parent_feature >= 0:
+                    parent_time_index = int(self.feature_index_map.get(parent_feature, 0))
+                else:
+                    parent_time_index = 0
+                false_roots[(parent_i, left)] = [1, depth_i, parent_time_index]
                 X_copy[(parent_i, left)] = [X[i]]
                 y_copy[(parent_i, left)] = [y[i]]
 
@@ -312,6 +333,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         cdef intp_t parent
         cdef bint is_left
         cdef intp_t n_node_samples = splitter.n_samples
+        cdef intp_t n_total_samples = splitter.n_samples  # Total sample count for gain normalization.
         cdef float64_t weighted_n_node_samples
         cdef intp_t node_id
         cdef float64_t right_child_min, left_child_min, right_child_max, left_child_max
@@ -322,8 +344,20 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         cdef float64_t middle_value
         cdef bint is_leaf
         cdef intp_t max_depth_seen = -1 if first else tree.max_depth
-
         cdef intp_t rc = 0
+        # Scratch variables for child time propagation.
+        cdef intp_t child_tp = 0
+        cdef intp_t child_tp2 = 0
+        cdef intp_t child_end
+        cdef intp_t left_end
+        cdef intp_t right_missing
+        cdef intp_t left_missing
+        cdef intp_t right_start
+        cdef intp_t right_end
+        cdef intp_t right_span
+        cdef intp_t left_span
+        cdef float64_t gain_normalized  # Normalized penalized gain used by the stop rule.
+        cdef float64_t gain_for_stop
 
         cdef stack[StackRecord] builder_stack
         cdef stack[StackRecord] update_stack
@@ -331,6 +365,8 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
         cdef ParentInfo parent_record
         _init_parent_record(&parent_record)
+        cdef intp_t parent_time_index
+
 
         if not first:
             # push reached leaf nodes onto stack
@@ -346,6 +382,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                     "n_constant_features": 0,
                     "lower_bound": -INFINITY,
                     "upper_bound": INFINITY,
+                    "time_index": value[2],  # Inherit the parent's split-time index.
                 })
                 start += value[0]
         else:
@@ -360,7 +397,12 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                 "n_constant_features": 0,
                 "lower_bound": -INFINITY,
                 "upper_bound": INFINITY,
+                "time_index": 0,  # root has t_p = 0
             })
+
+        cdef float64_t duration_weight
+        cdef intp_t node_missing_count
+        cdef float64_t node_impurity_value = 0
 
         with nogil:
             while not update_stack.empty():
@@ -376,24 +418,39 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                 parent_record.n_constant_features = stack_record.n_constant_features
                 parent_record.lower_bound = stack_record.lower_bound
                 parent_record.upper_bound = stack_record.upper_bound
+                parent_time_index = stack_record.time_index
+
+                if start < 0 or end > splitter.n_samples or end < start:
+                    with gil:
+                        raise RuntimeError(
+                            f"Invalid node range during TpT split update: "
+                            f"start={start} end={end} total={splitter.n_samples}"
+                        )
 
                 n_node_samples = end - start
                 splitter.node_reset(start, end, &weighted_n_node_samples)
-
+                
+                # Always compute THIS node's impurity after resetting splitter to this node's samples
+                # (not just when first==1, because parent_record.impurity was set from stack_record.impurity
+                # which is the parent's impurity, not this node's impurity)
+                parent_record.impurity = splitter.node_impurity()
+                if first:
+                    first = 0
+                
                 is_leaf = (depth >= max_depth or
                            n_node_samples < min_samples_split or
                            n_node_samples < 2 * min_samples_leaf or
                            weighted_n_node_samples < 2 * min_weight_leaf)
 
-                if first:
-                    parent_record.impurity = splitter.node_impurity()
-                    first = 0
-
                 # impurity == 0 with tolerance due to rounding errors
                 is_leaf = is_leaf or parent_record.impurity <= EPSILON
 
+                duration_weight = 0.0
+                node_missing_count = 0
+
                 if not is_leaf:
-                    splitter.node_split(
+                    splitter.node_time_index = parent_time_index
+                    rc = splitter.node_split(
                         &parent_record,
                         split_ptr,
                     )
@@ -401,16 +458,89 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                     # assign local copy of SplitRecord to assign
                     # pos, improvement, and impurity scores
                     split = deref(split_ptr)
+                    if split.pos < start or split.pos > end:
+                        with gil:
+                            raise RuntimeError(
+                                f"Invalid split position during update: "
+                                f"start={start} end={end} pos={split.pos} depth={depth}"
+                            )
+                    if rc != 0:
+                        is_leaf = True
+                        duration_weight = 0.0
+                        node_missing_count = 0
+                        split.pos = end
+                        split.improvement = 0.0
+                        split.impurity_left = parent_record.impurity
+                        split.impurity_right = parent_record.impurity
+                        split.impurity_duration = INFINITY
+                        split.n_missing = 0
+                        split.missing_go_to_left = 0
+                        split.split_time_index = parent_time_index
+                    else:
+                        node_missing_count = split.n_missing
+                        duration_weight = splitter.criterion.weighted_n_missing
+                        right_missing = 0
+                        left_missing = 0
+                        if split.missing_go_to_left:
+                            left_missing = node_missing_count
+                        else:
+                            right_missing = node_missing_count
+                        child_end = end - right_missing
+                        if child_end < start:
+                            child_end = start
+                        left_end = split.pos - left_missing
+                        if left_end < start:
+                            left_end = start
+                        if (split.pos <= start or child_end <= split.pos or
+                                left_end <= start):
+                            is_leaf = True
+                            duration_weight = 0.0
+                            node_missing_count = 0
 
-                    # If EPSILON=0 in the below comparison, float precision
-                    # issues stop splitting, producing trees that are
-                    # dissimilar to v0.18
-                    is_leaf = (is_leaf or split.pos >= end or
-                               (split.improvement + EPSILON <
-                                min_impurity_decrease))
+                        # If EPSILON=0 in the below comparison, float precision
+                        # issues stop splitting, producing trees that are
+                        # dissimilar to v0.18
+                        # Normalize the penalized gain with respect to the full training set.
+                        gain_for_stop = split.improvement
+                        if splitter.use_penalized_stop_gain:
+                            gain_for_stop = splitter.last_best_gain
+                        gain_normalized = (gain_for_stop * <float64_t>n_node_samples) / <float64_t>n_total_samples
+                        is_leaf = (is_leaf or split.pos >= end or
+                                   (gain_normalized + EPSILON <
+                                    min_impurity_decrease))
+                else:
+                    duration_weight = 0.0
+                    node_missing_count = 0
+                if is_leaf:
+                    duration_weight = 0.0
+                    node_missing_count = 0
+                right_missing = 0
+                left_missing = 0
+                if split.missing_go_to_left:
+                    left_missing = node_missing_count
+                else:
+                    right_missing = node_missing_count
+                child_end = end - right_missing
+                if child_end < start:
+                    child_end = start
+                if child_end < split.pos:
+                    child_end = split.pos
+                left_end = split.pos - left_missing
+                if left_end < start:
+                    left_end = start
+
+                # For leaf nodes, compute the actual leaf impurity
+                # (splitter has already been reset to leaf's samples)
+                # For non-leaf nodes, use THIS node's own impurity (parent_record.impurity),
+                # which was computed after splitter.node_reset() set the splitter to this node's samples.
+                # Do NOT use split.impurity_left/right which are the impurities of this node's CHILDREN.
+                if is_leaf:
+                    node_impurity_value = splitter.node_impurity()
+                else:
+                    node_impurity_value = parent_record.impurity
 
                 node_id = tree._update_node(parent, is_left, is_leaf, split_ptr,
-                                            parent_record.impurity,
+                                            node_impurity_value,
                                             n_node_samples, weighted_n_node_samples,
                                             split.missing_go_to_left)
 
@@ -418,15 +548,44 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                     rc = -1
                     break
 
+                if TPT_DEBUG_ENABLED and is_leaf:
+                    printf(
+                        "[TPT][DF][LEAF] depth=%lld samples=%lld gain=%g pos=%lld tp=%lld\n",
+                        <long long>depth,
+                        <long long>n_node_samples,
+                        split.improvement,
+                        <long long>split.pos,
+                        <long long>parent_time_index
+                    )
+
+                # Persist per-node TpT metadata on the node.
+                if not is_leaf:
+                    # we have already set: split = deref(split_ptr)
+                    tree.nodes[node_id].split_time_index = split.split_time_index
+                    tree.nodes[node_id].impurity_duration = split.impurity_duration
+                else:
+                    # carry the parent's t_p for leaves
+                    tree.nodes[node_id].split_time_index = parent_time_index
+                    # keep impurity_duration at default (INF) for now
+
                 # Store value for all nodes, to facilitate tree/model
                 # inspection and interpretation
                 splitter.node_value(tree.value + node_id * tree.value_stride)
+                splitter.node_duration_value(tree.value_duration + node_id * tree.value_stride)
                 if splitter.with_monotonic_cst:
                     splitter.clip_node_value(
                         tree.value + node_id * tree.value_stride,
                         parent_record.lower_bound,
                         parent_record.upper_bound
                     )
+                tree.nodes[node_id].weighted_n_duration = duration_weight
+                tree.nodes[node_id].n_duration_samples = node_missing_count
+
+                if node_missing_count < 0:
+                    node_missing_count = 0
+                child_end = end - node_missing_count
+                if child_end < split.pos:
+                    child_end = split.pos
 
                 if not is_leaf:
                     if (
@@ -461,31 +620,61 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                         left_child_min = middle_value
                         right_child_max = middle_value
 
-                    # Push right child on stack
-                    builder_stack.push({
-                        "start": split.pos,
-                        "end": end,
-                        "depth": depth + 1,
-                        "parent": node_id,
-                        "is_left": 0,
-                        "impurity": split.impurity_right,
-                        "n_constant_features": parent_record.n_constant_features,
-                        "lower_bound": right_child_min,
-                        "upper_bound": right_child_max,
-                    })
+                    # Child nodes inherit the current split-time index.
+                    child_tp = tree.nodes[node_id].split_time_index
+                    if child_tp < parent_time_index:
+                        child_tp = parent_time_index
 
-                    # Push left child on stack
-                    builder_stack.push({
-                        "start": start,
-                        "end": split.pos,
-                        "depth": depth + 1,
-                        "parent": node_id,
-                        "is_left": 1,
-                        "impurity": split.impurity_left,
-                        "n_constant_features": parent_record.n_constant_features,
-                        "lower_bound": left_child_min,
-                        "upper_bound": left_child_max,
-                    })
+                    right_start = split.pos
+                    right_span = child_end - right_start
+                    if right_span >= self.min_samples_leaf:
+                        if TPT_DEBUG_ENABLED:
+                            printf(
+                                "[TPT][DF][PUSH-R] depth=%lld start=%lld end=%lld span=%lld tp=%lld imp=%g\n",
+                                <long long>(depth + 1),
+                                <long long>right_start,
+                                <long long>child_end,
+                                <long long>right_span,
+                                <long long>child_tp,
+                                split.impurity_right
+                            )
+                        builder_stack.push({
+                            "start": right_start,
+                            "end": child_end,
+                            "depth": depth + 1,
+                            "parent": node_id,
+                            "is_left": 0,
+                            "impurity": split.impurity_right,
+                            "n_constant_features": parent_record.n_constant_features,
+                            "lower_bound": right_child_min,
+                            "upper_bound": right_child_max,
+                            "time_index": child_tp,
+                        })
+
+                    left_span = left_end - start
+                    if left_span >= self.min_samples_leaf:
+                        if TPT_DEBUG_ENABLED:
+                            printf(
+                                "[TPT][DF][PUSH-L] depth=%lld start=%lld end=%lld span=%lld tp=%lld imp=%g\n",
+                                <long long>(depth + 1),
+                                <long long>start,
+                                <long long>left_end,
+                                <long long>left_span,
+                                <long long>child_tp,
+                                split.impurity_left
+                            )
+                        builder_stack.push({
+                            "start": start,
+                            "end": left_end,
+                            "depth": depth + 1,
+                            "parent": node_id,
+                            "is_left": 1,
+                            "impurity": split.impurity_left,
+                            "n_constant_features": parent_record.n_constant_features,
+                            "lower_bound": left_child_min,
+                            "upper_bound": left_child_max,
+                            "time_index": child_tp,
+                        })
                 elif store_leaf_values and is_leaf:
                     # copy leaf values to leaf_values array
                     splitter.node_samples(tree.value_samples[node_id])
@@ -506,56 +695,152 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                 parent_record.n_constant_features = stack_record.n_constant_features
                 parent_record.lower_bound = stack_record.lower_bound
                 parent_record.upper_bound = stack_record.upper_bound
+                parent_time_index = stack_record.time_index
+
+                if TPT_DEBUG_ENABLED:
+                    printf(
+                        "[TPT][DF][POP] depth=%lld start=%lld end=%lld parent=%lld is_left=%d tp=%lld samples=%lld\n",
+                        <long long>depth,
+                        <long long>start,
+                        <long long>end,
+                        <long long>parent,
+                        <int>is_left,
+                        <long long>parent_time_index,
+                        <long long>(end - start)
+                    )
+
+                if start < 0 or end > splitter.n_samples or end < start:
+                    with gil:
+                        raise RuntimeError(
+                            f"Invalid node range during TpT build: "
+                            f"start={start} end={end} total={splitter.n_samples}"
+                        )
 
                 n_node_samples = end - start
                 splitter.node_reset(start, end, &weighted_n_node_samples)
-
+                
+                # Always compute THIS node's impurity after resetting splitter to this node's samples
+                # (not just when first==1, because parent_record.impurity was set from stack_record.impurity
+                # which is the parent's impurity, not this node's impurity)
+                parent_record.impurity = splitter.node_impurity()
+                if first:
+                    first=0
+                
                 is_leaf = (depth >= max_depth or
                            n_node_samples < min_samples_split or
                            n_node_samples < 2 * min_samples_leaf or
                            weighted_n_node_samples < 2 * min_weight_leaf)
 
-                if first:
-                    parent_record.impurity = splitter.node_impurity()
-                    first=0
-
                 # impurity == 0 with tolerance due to rounding errors
                 is_leaf = is_leaf or parent_record.impurity <= EPSILON
 
+                duration_weight = 0.0
+                node_missing_count = 0
                 if not is_leaf:
-                    splitter.node_split(
+                    splitter.node_time_index = parent_time_index
+
+                    rc = splitter.node_split(
                         &parent_record,
                         split_ptr,
                     )
 
-                    # assign local copy of SplitRecord to assign
-                    # pos, improvement, and impurity scores
-                    split = deref(split_ptr)
+                    if TPT_DEBUG_ENABLED:
+                        printf(
+                            "[TPT][DF][NODE_SPLIT] depth=%lld rc=%d pos=%lld gain=%g tp_parent=%lld\n",
+                            <long long>depth,
+                            rc,
+                            <long long>deref(split_ptr).pos,
+                            deref(split_ptr).improvement,
+                            <long long>parent_time_index
+                        )
 
-                    # If EPSILON=0 in the below comparison, float precision
-                    # issues stop splitting, producing trees that are
-                    # dissimilar to v0.18
-                    is_leaf = (is_leaf or split.pos >= end or
-                               (split.improvement + EPSILON <
-                                min_impurity_decrease))
+                    if rc != 0:
+                        split = deref(split_ptr)
+                        split.pos = end
+                        split.improvement = 0.0
+                        split.impurity_left = parent_record.impurity
+                        split.impurity_right = parent_record.impurity
+                        split.n_missing = 0
+                        split.missing_go_to_left = 0
+                        split.split_time_index = parent_time_index
+                        split.impurity_duration = INFINITY
+                        duration_weight = 0.0
+                        node_missing_count = 0
+                        is_leaf = True
+                    else:
+                        # assign local copy of SplitRecord to assign
+                        # pos, improvement, and impurity scores
+                        split = deref(split_ptr)
+                        if split.pos < start or split.pos > end:
+                            with gil:
+                                raise RuntimeError(
+                                    f"Invalid split position during build: "
+                                    f"start={start} end={end} pos={split.pos} depth={depth}"
+                                )
+                        node_missing_count = split.n_missing
+                        duration_weight = splitter.criterion.weighted_n_missing
 
+                        # If EPSILON=0 in the below comparison, float precision
+                        # issues stop splitting, producing trees that are
+                        # dissimilar to v0.18
+                        # Normalize the penalized gain with respect to the full training set.
+                        gain_for_stop = split.improvement
+                        if splitter.use_penalized_stop_gain:
+                            gain_for_stop = splitter.last_best_gain
+                        gain_normalized = (gain_for_stop * <float64_t>n_node_samples) / <float64_t>n_total_samples
+                        is_leaf = (is_leaf or split.pos >= end or
+                                   (gain_normalized + EPSILON <
+                                    min_impurity_decrease))
+                else:
+                    duration_weight = 0.0
+                    node_missing_count = 0
+                if is_leaf:
+                    duration_weight = 0.0
+                    node_missing_count = 0
+                
+                # For leaf nodes, compute the actual leaf impurity
+                # (splitter has already been reset to leaf's samples)
+                # For non-leaf nodes, use THIS node's own impurity (parent_record.impurity),
+                # which was computed after splitter.node_reset() set the splitter to this node's samples.
+                # Do NOT use split.impurity_left/right which are the impurities of this node's CHILDREN.
+                if is_leaf:
+                    node_impurity_value = splitter.node_impurity()
+                else:
+                    node_impurity_value = parent_record.impurity
+                
                 node_id = tree._add_node(parent, is_left, is_leaf, split_ptr,
-                                         parent_record.impurity, n_node_samples,
+                                         node_impurity_value, n_node_samples,
                                          weighted_n_node_samples, split.missing_go_to_left)
 
                 if node_id == INTPTR_MAX:
                     rc = -1
                     break
 
+                # Persist per-node TpT metadata on the node.
+                if not is_leaf:
+                    tree.nodes[node_id].split_time_index = split.split_time_index
+                    tree.nodes[node_id].impurity_duration = split.impurity_duration
+                else:
+                    tree.nodes[node_id].split_time_index = parent_time_index
+
                 # Store value for all nodes, to facilitate tree/model
                 # inspection and interpretation
                 splitter.node_value(tree.value + node_id * tree.value_stride)
+                splitter.node_duration_value(tree.value_duration + node_id * tree.value_stride)
                 if splitter.with_monotonic_cst:
                     splitter.clip_node_value(
                         tree.value + node_id * tree.value_stride,
                         parent_record.lower_bound,
                         parent_record.upper_bound
                     )
+                tree.nodes[node_id].weighted_n_duration = duration_weight
+                tree.nodes[node_id].n_duration_samples = node_missing_count
+
+                if node_missing_count < 0:
+                    node_missing_count = 0
+                child_end = end - node_missing_count
+                if child_end < split.pos:
+                    child_end = split.pos
 
                 if not is_leaf:
                     if (
@@ -590,10 +875,14 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                         left_child_min = middle_value
                         right_child_max = middle_value
 
-                    # Push right child on stack
+                    # Push children while carrying the split-time index forward.
+                    child_tp2 = tree.nodes[node_id].split_time_index
+                    if child_tp2 < parent_time_index:
+                        child_tp2 = parent_time_index
+
                     builder_stack.push({
                         "start": split.pos,
-                        "end": end,
+                        "end": child_end,
                         "depth": depth + 1,
                         "parent": node_id,
                         "is_left": 0,
@@ -601,6 +890,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                         "n_constant_features": parent_record.n_constant_features,
                         "lower_bound": right_child_min,
                         "upper_bound": right_child_max,
+                        "time_index": child_tp2,
                     })
 
                     # Push left child on stack
@@ -614,6 +904,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                         "n_constant_features": parent_record.n_constant_features,
                         "lower_bound": left_child_min,
                         "upper_bound": left_child_max,
+                        "time_index": child_tp2,
                     })
                 elif store_leaf_values and is_leaf:
                     # copy leaf values to leaf_values array
@@ -652,6 +943,10 @@ cdef struct FrontierRecord:
     float64_t lower_bound
     float64_t upper_bound
     float64_t middle_value
+    intp_t time_index  # Parent split-time index for this node.
+    intp_t left_end_trimmed
+    intp_t right_start_trimmed
+
 
 cdef inline bool _compare_records(
     const FrontierRecord& left,
@@ -677,6 +972,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
     cdef intp_t max_leaf_nodes
     cdef float64_t threshold_gain
     cdef dict feature_index_map
+    cdef intp_t n_total_samples  # Total sample count for gain normalization.
 
     def __cinit__(
         self,
@@ -755,6 +1051,11 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         cdef intp_t max_depth_seen = -1
         cdef intp_t rc = 0
         cdef Node* node
+        cdef intp_t left_active_end
+        cdef intp_t right_active_start
+
+        # Store the total sample count used to normalize penalized gains.
+        self.n_total_samples = splitter.n_samples
 
         cdef ParentInfo parent_record
         _init_parent_record(&parent_record)
@@ -776,6 +1077,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                 depth=0,
                 parent_record=&parent_record,
                 res=&split_node_left,
+                parent_time_index=0,
             )
             if rc >= 0:
                 _add_to_frontier(split_node_left, frontier)
@@ -787,6 +1089,8 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
 
                 node = &tree.nodes[record.node_id]
                 is_leaf = (record.is_leaf or max_split_nodes <= 0)
+                left_active_end = record.left_end_trimmed
+                right_active_start = record.right_start_trimmed
 
                 if is_leaf:
                     # Node is not expandable; set node as leaf
@@ -800,6 +1104,15 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                         splitter.node_samples(tree.value_samples[record.node_id])
                 else:
                     # Node is expandable
+                    if (left_active_end <= record.start or
+                            record.end <= right_active_start):
+                        node.left_child = _TREE_LEAF
+                        node.right_child = _TREE_LEAF
+                        node.feature = _TREE_UNDEFINED
+                        node.threshold = _TREE_UNDEFINED
+                        if store_leaf_values:
+                            splitter.node_samples(tree.value_samples[record.node_id])
+                        continue
 
                     if (
                         not splitter.with_monotonic_cst or
@@ -842,13 +1155,14 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                         splitter=splitter,
                         tree=tree,
                         start=record.start,
-                        end=record.pos,
+                        end=left_active_end,
                         is_first=IS_NOT_FIRST,
                         is_left=IS_LEFT,
                         parent=node,
                         depth=record.depth + 1,
                         parent_record=&parent_record,
                         res=&split_node_left,
+                        parent_time_index=record.time_index,
                     )
                     if rc == -1:
                         break
@@ -863,7 +1177,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                     rc = self._add_split_node(
                         splitter=splitter,
                         tree=tree,
-                        start=record.pos,
+                        start=right_active_start,
                         end=record.end,
                         is_first=IS_NOT_FIRST,
                         is_left=IS_NOT_LEFT,
@@ -871,6 +1185,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                         depth=record.depth + 1,
                         parent_record=&parent_record,
                         res=&split_node_right,
+                        parent_time_index=record.time_index,
                     )
                     if rc == -1:
                         break
@@ -902,7 +1217,8 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         Node* parent,
         intp_t depth,
         ParentInfo* parent_record,
-        FrontierRecord* res
+        FrontierRecord* res,
+        intp_t parent_time_index
     ) except -1 nogil:
         """Adds node w/ partition ``[start, end)`` to the frontier. """
         cdef SplitRecord split
@@ -918,14 +1234,30 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         cdef float64_t min_impurity_decrease = self.min_impurity_decrease
         cdef float64_t weighted_n_node_samples
         cdef bint is_leaf
+        cdef int rc = 0
+        cdef intp_t child_tp3
+        cdef intp_t child_end
+        cdef float64_t gain_normalized  # Normalized penalized gain used by the stop rule.
+        cdef float64_t gain_for_stop
+        cdef float64_t duration_weight = 0.0
+        cdef intp_t node_missing_count = 0
+        cdef intp_t left_end
+        cdef intp_t right_missing
+        cdef intp_t left_missing
+        cdef intp_t right_start
+        cdef intp_t right_end
+        cdef intp_t right_span
+        cdef intp_t left_span
+        cdef float64_t node_impurity_value = 0
 
         splitter.node_reset(start, end, &weighted_n_node_samples)
 
         # reset n_constant_features for this specific split before beginning split search
         parent_record.n_constant_features = 0
 
-        if is_first:
-            parent_record.impurity = splitter.node_impurity()
+        # Always compute THIS node's impurity after resetting splitter to this node's samples
+        # (not just when is_first==1, because we need the correct impurity for this node)
+        parent_record.impurity = splitter.node_impurity()
 
         n_node_samples = end - start
         is_leaf = (depth >= self.max_depth or
@@ -936,42 +1268,159 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                    )
 
         if not is_leaf:
-            splitter.node_split(
+            splitter.node_time_index = parent_time_index
+            rc = splitter.node_split(
                 parent_record,
                 split_ptr,
             )
             # assign local copy of SplitRecord to assign
             # pos, improvement, and impurity scores
             split = deref(split_ptr)
+            if rc != 0:
+                is_leaf = True
+                duration_weight = 0.0
+                node_missing_count = 0
+                split.pos = end
+                split.improvement = 0.0
+                split.impurity_left = parent_record.impurity
+                split.impurity_right = parent_record.impurity
+                split.impurity_duration = INFINITY
+                split.n_missing = 0
+                split.missing_go_to_left = 0
+                split.split_time_index = parent_time_index
+            else:
+                if split.pos < start or split.pos > end:
+                    with gil:
+                        raise RuntimeError(
+                            f"Invalid split position (best-first): "
+                            f"start={start} end={end} pos={split.pos} depth={depth}"
+                        )
+                node_missing_count = split.n_missing
+                duration_weight = splitter.criterion.weighted_n_missing
+                right_missing = 0
+                left_missing = 0
+                if split.missing_go_to_left:
+                    left_missing = node_missing_count
+                else:
+                    right_missing = node_missing_count
+                child_end = end - right_missing
+                if child_end < start:
+                    child_end = start
+                left_end = split.pos - left_missing
+                if left_end < start:
+                    left_end = start
+                if (split.pos <= start or child_end <= split.pos or
+                        left_end <= start):
+                    is_leaf = True
+                    duration_weight = 0.0
+                    node_missing_count = 0
 
-            # If EPSILON=0 in the below comparison, float precision issues stop
-            # splitting early, producing trees that are dissimilar to v0.18
-            is_leaf = (is_leaf or split.pos >= end or
-                       split.improvement + EPSILON < min_impurity_decrease)
-
+                # If EPSILON=0 in the below comparison, float precision issues stop
+                # splitting early, producing trees that are dissimilar to v0.18
+                # Normalize the penalized gain with respect to the full training set.
+                gain_for_stop = split.improvement
+                if splitter.use_penalized_stop_gain:
+                    gain_for_stop = splitter.last_best_gain
+                gain_normalized = (gain_for_stop * <float64_t>n_node_samples) / <float64_t>self.n_total_samples
+                is_leaf = (is_leaf or split.pos >= end or
+                           gain_normalized + EPSILON < min_impurity_decrease)
+        else:
+            duration_weight = 0.0
+            node_missing_count = 0
+        if is_leaf:
+            duration_weight = 0.0
+            node_missing_count = 0
+        right_missing = 0
+        left_missing = 0
+        if split.missing_go_to_left:
+            left_missing = node_missing_count
+        else:
+            right_missing = node_missing_count
+        child_end = end - right_missing
+        if child_end < start:
+            child_end = start
+        if child_end < split.pos:
+            child_end = split.pos
+        left_end = split.pos - left_missing
+        if left_end < start:
+            left_end = start
+        
+        # For leaf nodes, compute the actual leaf impurity
+        # (splitter has already been reset to leaf's samples)
+        # For non-leaf nodes, use THIS node's own impurity (parent_record.impurity),
+        # which was computed after splitter.node_reset() set the splitter to this node's samples.
+        # Do NOT use split.impurity_left/right which are the impurities of this node's CHILDREN.
+        if is_leaf:
+            node_impurity_value = splitter.node_impurity()
+        else:
+            node_impurity_value = parent_record.impurity
+        
         node_id = tree._add_node(parent - tree.nodes
                                  if parent != NULL
                                  else _TREE_UNDEFINED,
                                  is_left, is_leaf,
-                                 split_ptr, parent_record.impurity,
+                                 split_ptr, node_impurity_value,
                                  n_node_samples, weighted_n_node_samples,
                                  split.missing_go_to_left)
         if node_id == INTPTR_MAX:
             return -1
 
+        # Persist per-node TpT metadata on the node.
+        if not is_leaf:
+            # split was set from deref(split_ptr) above
+            tree.nodes[node_id].split_time_index = split.split_time_index
+            tree.nodes[node_id].impurity_duration = split.impurity_duration
+        else:
+            tree.nodes[node_id].split_time_index = parent_time_index
+
         # compute values also for split nodes (might become leafs later).
         splitter.node_value(tree.value + node_id * tree.value_stride)
+        splitter.node_duration_value(tree.value_duration + node_id * tree.value_stride)
         if splitter.with_monotonic_cst:
             splitter.clip_node_value(tree.value + node_id * tree.value_stride, parent_record.lower_bound, parent_record.upper_bound)
+        tree.nodes[node_id].weighted_n_duration = duration_weight
+        tree.nodes[node_id].n_duration_samples = node_missing_count
+
+        if node_missing_count < 0:
+            node_missing_count = 0
+        right_missing = 0
+        left_missing = 0
+        if split.missing_go_to_left:
+            left_missing = node_missing_count
+        else:
+            right_missing = node_missing_count
+        child_end = end - right_missing
+        if child_end < start:
+            child_end = start
+        if child_end < split.pos:
+            child_end = split.pos
+        left_end = split.pos - left_missing
+        if left_end < start:
+            left_end = start
 
         res.node_id = node_id
         res.start = start
-        res.end = end
+        res.end = child_end
         res.depth = depth
         res.impurity = parent_record.impurity
         res.lower_bound = parent_record.lower_bound
         res.upper_bound = parent_record.upper_bound
         res.middle_value = splitter.criterion.middle_value()
+        # Default carry-over when the node is a leaf or no new split time is set.
+        res.time_index = parent_time_index
+
+        # Track trimmed child spans so best-first builder can avoid reintroducing missing blocks.
+        if not is_leaf:
+            right_start = split.pos
+            if right_start < left_end:
+                right_start = left_end
+            if right_start > child_end:
+                right_start = child_end
+            res.left_end_trimmed = left_end
+            res.right_start_trimmed = right_start
+        else:
+            res.left_end_trimmed = start
+            res.right_start_trimmed = child_end
 
         if not is_leaf:
             # is split node
@@ -980,10 +1429,14 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
             res.improvement = split.improvement
             res.impurity_left = split.impurity_left
             res.impurity_right = split.impurity_right
-
+            # Children inherit this split-time index.
+            child_tp3 = tree.nodes[node_id].split_time_index
+            if child_tp3 < parent_time_index:
+                child_tp3 = parent_time_index
+            res.time_index = child_tp3
         else:
             # is leaf => 0 improvement
-            res.pos = end
+            res.pos = left_end
             res.is_leaf = 1
             res.improvement = 0.0
             res.impurity_left = parent_record.impurity
@@ -1033,10 +1486,14 @@ cdef class BaseTree:
 
         safe_realloc(&self.nodes, capacity)
         safe_realloc(&self.value, capacity * self.value_stride)
+        safe_realloc(&self.value_duration, capacity * self.value_stride)
 
         if capacity > self.capacity:
             # value memory is initialised to 0 to enable classifier argmax
             memset(<void*>(self.value + self.capacity * self.value_stride), 0,
+                   (capacity - self.capacity) * self.value_stride *
+                   sizeof(float64_t))
+            memset(<void*>(self.value_duration + self.capacity * self.value_stride), 0,
                    (capacity - self.capacity) * self.value_stride *
                    sizeof(float64_t))
             # node memory is initialised to 0 to ensure deterministic pickle (padding in Node struct)
@@ -1154,6 +1611,11 @@ cdef class BaseTree:
         node.impurity = impurity
         node.n_node_samples = n_node_samples
         node.weighted_n_node_samples = weighted_n_node_samples
+        # Initialize TpT-specific node metadata.
+        node.split_time_index = -1
+        node.impurity_duration = INFINITY
+        node.weighted_n_duration = 0.0
+        node.n_duration_samples = 0
 
         if parent != _TREE_UNDEFINED:
             if is_left:
@@ -1206,6 +1668,11 @@ cdef class BaseTree:
         node.impurity = impurity
         node.n_node_samples = n_node_samples
         node.weighted_n_node_samples = weighted_n_node_samples
+        # Initialize TpT-specific node metadata.
+        node.split_time_index = -1
+        node.impurity_duration = INFINITY
+        node.weighted_n_duration = 0.0
+        node.n_duration_samples = 0
 
         if is_leaf:
             if self._set_leaf_node(split_node, node, node_id) != 1:
@@ -1248,17 +1715,23 @@ cdef class BaseTree:
         # Initialize auxiliary data-structure
         cdef Node* node = NULL
         cdef intp_t i = 0
+        cdef bint duration_taken
 
         with nogil:
             for i in range(n_samples):
                 node = self.nodes
+                duration_taken = False
 
                 # While node not a leaf
                 while node.left_child != _TREE_LEAF:
                     X_i_node_feature = self._compute_feature(X_ndarray, i, node)
                     # ... and node.right_child != _TREE_LEAF:
                     if isnan(X_i_node_feature):
-                        if node.missing_go_to_left:
+                        if node.impurity_duration < INFINITY and node.weighted_n_duration > 0.0:
+                            out[i] = -(<intp_t>(node - self.nodes) + 1)
+                            duration_taken = True
+                            break
+                        elif node.missing_go_to_left:
                             node = &self.nodes[node.left_child]
                         else:
                             node = &self.nodes[node.right_child]
@@ -1266,6 +1739,9 @@ cdef class BaseTree:
                         node = &self.nodes[node.left_child]
                     else:
                         node = &self.nodes[node.right_child]
+
+                if duration_taken:
+                    continue
 
                 out[i] = <intp_t>(node - self.nodes)  # node offset
 
@@ -1313,6 +1789,7 @@ cdef class BaseTree:
 
             for i in range(n_samples):
                 node = self.nodes
+                duration_taken = False
 
                 for k in range(X_indptr[i], X_indptr[i + 1]):
                     feature_to_sample[X_indices[k]] = i
@@ -1326,12 +1803,22 @@ cdef class BaseTree:
                     else:
                         feature_value = 0.
 
-                    if feature_value <= node.threshold:
+                    if isnan(feature_value):
+                        if node.impurity_duration < INFINITY and node.weighted_n_duration > 0.0:
+                            out[i] = -(<intp_t>(node - self.nodes) + 1)
+                            duration_taken = True
+                            break
+                        elif node.missing_go_to_left:
+                            node = &self.nodes[node.left_child]
+                        else:
+                            node = &self.nodes[node.right_child]
+                    elif feature_value <= node.threshold:
                         node = &self.nodes[node.left_child]
                     else:
                         node = &self.nodes[node.right_child]
 
-                out[i] = <intp_t>(node - self.nodes)  # node offset
+                if not duration_taken:
+                    out[i] = <intp_t>(node - self.nodes)  # node offset
 
             # Free auxiliary arrays
             free(X_sample)
@@ -1785,12 +2272,32 @@ cdef class Tree(BaseTree):
         return self._get_value_ndarray()[:self.node_count]
 
     @property
+    def duration_value(self):
+        return self._get_duration_value_ndarray()[:self.node_count]
+
+    @property
+    def split_time_index(self):
+        return self._get_node_ndarray()['split_time_index'][:self.node_count]
+
+    @property
     def leaf_nodes_samples(self):
         leaf_node_samples = dict()
         keys = self._get_value_samples_keys()
         for node_id in keys:
             leaf_node_samples[node_id] = self._get_value_samples_ndarray(node_id)
         return leaf_node_samples
+
+    @property
+    def impurity_duration(self):
+        return self._get_node_ndarray()['impurity_duration'][:self.node_count]
+
+    @property
+    def weighted_n_duration(self):
+        return self._get_node_ndarray()['weighted_n_duration'][:self.node_count]
+
+    @property
+    def n_duration_samples(self):
+        return self._get_node_ndarray()['n_duration_samples'][:self.node_count]
 
     # TODO: Convert n_classes to cython.integral memory view once
     #  https://github.com/cython/cython/issues/5243 is fixed
@@ -1819,6 +2326,7 @@ cdef class Tree(BaseTree):
         self.node_count = 0
         self.capacity = 0
         self.value = NULL
+        self.value_duration = NULL
         self.nodes = NULL
 
         # initialize the hash map for the value samples
@@ -1829,6 +2337,7 @@ cdef class Tree(BaseTree):
         # Free all inner structures
         free(self.n_classes)
         free(self.value)
+        free(self.value_duration)
         free(self.nodes)
 
     def __reduce__(self):
@@ -1845,6 +2354,7 @@ cdef class Tree(BaseTree):
         d["node_count"] = self.node_count
         d["nodes"] = self._get_node_ndarray()
         d["values"] = self._get_value_ndarray()
+        d["values_duration"] = self._get_duration_value_ndarray()
         d['value_samples'] = self.leaf_nodes_samples
         return d
 
@@ -1859,6 +2369,7 @@ cdef class Tree(BaseTree):
 
         node_ndarray = d['nodes']
         value_ndarray = d['values']
+        value_duration_ndarray = d.get('values_duration')
 
         value_shape = (node_ndarray.shape[0], self.n_outputs,
                        self.max_n_classes)
@@ -1869,6 +2380,12 @@ cdef class Tree(BaseTree):
             expected_dtype=np.dtype(np.float64),
             expected_shape=value_shape
         )
+        if value_duration_ndarray is not None:
+            value_duration_ndarray = _check_value_ndarray(
+                value_duration_ndarray,
+                expected_dtype=np.dtype(np.float64),
+                expected_shape=value_shape
+            )
 
         self.capacity = node_ndarray.shape[0]
         if self._resize_c(self.capacity) != 0:
@@ -1878,6 +2395,11 @@ cdef class Tree(BaseTree):
                self.capacity * sizeof(Node))
         memcpy(self.value, cnp.PyArray_DATA(value_ndarray),
                self.capacity * self.value_stride * sizeof(float64_t))
+        if value_duration_ndarray is not None:
+            memcpy(self.value_duration, cnp.PyArray_DATA(value_duration_ndarray),
+                   self.capacity * self.value_stride * sizeof(float64_t))
+        else:
+            memset(<void*>self.value_duration, 0, self.capacity * self.value_stride * sizeof(float64_t))
 
         # store the leaf node samples if they exist
         value_samples_dict = d['value_samples']
@@ -1925,6 +2447,19 @@ cdef class Tree(BaseTree):
             raise ValueError("Can't initialize array.")
         return arr
 
+    cdef cnp.ndarray _get_duration_value_ndarray(self):
+        """Wraps duration_value as a 3-d NumPy array."""
+        cdef cnp.npy_intp shape[3]
+        shape[0] = <cnp.npy_intp> self.node_count
+        shape[1] = <cnp.npy_intp> self.n_outputs
+        shape[2] = <cnp.npy_intp> self.max_n_classes
+        cdef cnp.ndarray arr
+        arr = cnp.PyArray_SimpleNewFromData(3, shape, cnp.NPY_DOUBLE, self.value_duration)
+        Py_INCREF(self)
+        if PyArray_SetBaseObject(arr, <PyObject*> self) < 0:
+            raise ValueError("Can't initialize array.")
+        return arr
+
     cdef cnp.ndarray _get_node_ndarray(self):
         """Wraps nodes as a NumPy struct array.
 
@@ -1949,11 +2484,34 @@ cdef class Tree(BaseTree):
 
     cpdef cnp.ndarray predict(self, object X):
         """Predict target for X."""
-        out = self._get_value_ndarray().take(self.apply(X), axis=0,
-                                             mode='clip')
+        cdef cnp.ndarray[intp_t, ndim=1, mode='c'] leaf_indices = self.apply(X)
+        cdef Py_ssize_t n_samples = leaf_indices.shape[0]
+        cdef cnp.ndarray[float64_t, ndim=3, mode='c'] out = np.empty(
+            (n_samples, self.n_outputs, self.max_n_classes), dtype=np.float64
+        )
+        cdef float64_t[:, :, :] out_view = out
+        cdef float64_t* value_ptr = self.value
+        cdef float64_t* duration_ptr = self.value_duration
+        cdef Py_ssize_t stride = self.value_stride
+        cdef Py_ssize_t i
+        cdef intp_t idx
+
+        with nogil:
+            for i in range(n_samples):
+                idx = leaf_indices[i]
+                if idx >= 0:
+                    memcpy(&out_view[i, 0, 0],
+                           value_ptr + idx * stride,
+                           stride * sizeof(float64_t))
+                else:
+                    idx = -idx - 1
+                    memcpy(&out_view[i, 0, 0],
+                           duration_ptr + idx * stride,
+                           stride * sizeof(float64_t))
+
         if self.n_outputs == 1:
-            out = out.reshape(X.shape[0], self.max_n_classes)
-        return out
+            return np.asarray(out)[:, 0, :]
+        return np.asarray(out)
 
 
 def _check_n_classes(n_classes, expected_dtype):
@@ -2009,7 +2567,8 @@ def _dtype_to_dict(dtype):
 
 def _dtype_dict_with_modified_bitness(dtype_dict):
     # field names in Node struct with intp_t types (see sklearn/tree/_tree.pxd)
-    indexing_field_names = ["left_child", "right_child", "feature", "n_node_samples"]
+    indexing_field_names = ["left_child", "right_child", "feature", "n_node_samples",
+                            "split_time_index", "n_duration_samples"]
 
     expected_dtype_size = str(struct.calcsize("P"))
     allowed_dtype_size = "8" if expected_dtype_size == "4" else "4"
@@ -2471,9 +3030,18 @@ cdef _build_pruned_tree(
                 rc = -1
                 break
 
+            # Copy TpT-specific metadata into the pruned tree.
+            tree.nodes[new_node_id].split_time_index = node.split_time_index
+            tree.nodes[new_node_id].impurity_duration = node.impurity_duration
+            tree.nodes[new_node_id].weighted_n_duration = node.weighted_n_duration
+            tree.nodes[new_node_id].n_duration_samples = node.n_duration_samples
+
             # copy value from original tree to new tree
             orig_value_ptr = orig_tree.value + value_stride * orig_node_id
             new_value_ptr = tree.value + value_stride * new_node_id
+            memcpy(new_value_ptr, orig_value_ptr, sizeof(float64_t) * value_stride)
+            orig_value_ptr = orig_tree.value_duration + value_stride * orig_node_id
+            new_value_ptr = tree.value_duration + value_stride * new_node_id
             memcpy(new_value_ptr, orig_value_ptr, sizeof(float64_t) * value_stride)
 
             if not is_leaf:

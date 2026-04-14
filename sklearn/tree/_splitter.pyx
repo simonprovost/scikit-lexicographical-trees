@@ -3,6 +3,7 @@
 
 from cython cimport final
 from libc.math cimport isnan
+from libc.math cimport exp
 from libc.stdlib cimport qsort
 from libc.string cimport memcpy
 
@@ -29,12 +30,14 @@ cdef float32_t EXTRACT_NNZ_SWITCH = 0.1
 cdef inline void _init_split(SplitRecord* self, intp_t start_pos) noexcept nogil:
     self.impurity_left = INFINITY
     self.impurity_right = INFINITY
+    self.impurity_duration = INFINITY
     self.pos = start_pos
     self.feature = 0
     self.threshold = 0.
     self.improvement = -INFINITY
     self.missing_go_to_left = False
     self.n_missing = 0
+    self.split_time_index = -1  # keep or drop depending on whether you use TpT indexing
 
 cdef class BaseSplitter:
     """This is an abstract interface for splitters.
@@ -109,6 +112,10 @@ cdef class BaseSplitter:
         """Copy the value of node samples[start:end] into dest."""
         pass
 
+    cdef void node_duration_value(self, float64_t* dest) noexcept nogil:
+        """Copy the duration value of node samples[start:end] into dest."""
+        pass
+
     cdef float64_t node_impurity(self) noexcept nogil:
         """Return the impurity of the current node."""
         pass
@@ -174,6 +181,8 @@ cdef class Splitter(BaseSplitter):
         self.monotonic_cst = monotonic_cst
         self.with_monotonic_cst = monotonic_cst is not None
         self.threshold_gain = threshold_gain
+        self.last_best_gain = -INFINITY
+        self.use_penalized_stop_gain = False
         self.feature_index_map = feature_index_map
 
     def __reduce__(self):
@@ -259,6 +268,8 @@ cdef class Splitter(BaseSplitter):
         self.sample_weight = sample_weight
 
         self.threshold_gain = threshold_gain
+        self.last_best_gain = -INFINITY
+        self.use_penalized_stop_gain = False
         self.feature_index_map = feature_index_map
 
         self.criterion.init(
@@ -326,6 +337,11 @@ cdef class Splitter(BaseSplitter):
         """Copy the value of node samples[start:end] into dest."""
 
         self.criterion.node_value(dest)
+
+    cdef void node_duration_value(self, float64_t* dest) noexcept nogil:
+        """Copy the duration (missing-branch) value of node samples[start:end] into dest."""
+
+        self.criterion.node_duration_value(dest)
 
     cdef inline void clip_node_value(self, float64_t* dest, float64_t lower_bound, float64_t upper_bound) noexcept nogil:
         """Clip the value in dest between lower_bound and upper_bound for monotonic constraints."""
@@ -782,7 +798,9 @@ cdef inline int node_lexicoRF_split(
         # f_j in the interval [n_total_constants, f_i[
         current_split.feature = features[f_j]
         partitioner.sort_samples_and_feature_values(current_split.feature)
-        criterion.init_missing(0)  # MISSING VALUES ARE NOT HANDLED
+        # Enable missing value handling for duration leaves
+        # Missing values in future time columns indicate terminated subjects
+        criterion.init_missing(partitioner.n_missing)
 
         if feature_values[end - 1] <= feature_values[start] + FEATURE_THRESHOLD:
             features[f_j], features[n_total_constants] = features[n_total_constants], features[f_j]
@@ -884,7 +902,203 @@ cdef inline int node_lexicoRF_split(
     split[0] = best_split
     return 0
 
+cdef inline int node_TpT_split(
+    Splitter splitter,
+    Partitioner partitioner,
+    Criterion criterion,
+    ParentInfo* parent_record,
+    SplitRecord* split,
+    float threshold_gain,
+    dict feature_index_map
+) except -1 nogil:
+    """
+    Find the best split on node samples[start:end] using TpT time-penalized splitting.
+    The proxy impurity improvement is multiplied by exp(-threshold_gain * Δt_proxy),
+    where Δt_proxy is approximated by the wave index of the splitting feature.
+    """
+    cdef intp_t start = splitter.start
+    cdef intp_t end = splitter.end
+    cdef intp_t[::1] features = splitter.features
+    cdef float32_t[::1] feature_values = splitter.feature_values
+    cdef intp_t max_features = splitter.max_features
+    cdef intp_t min_samples_leaf = splitter.min_samples_leaf
+    cdef double min_weight_leaf = splitter.min_weight_leaf
+    cdef uint32_t* random_state = &splitter.rand_r_state
 
+    cdef SplitRecord best_split, current_split
+    cdef double best_penalized_gain = -INFINITY
+
+    cdef double impurity = parent_record.impurity
+    cdef intp_t n_known_constants = parent_record.n_constant_features
+    cdef intp_t n_visited_features = 0
+    cdef intp_t n_found_constants = 0
+    cdef intp_t n_drawn_constants = 0
+    cdef intp_t n_total_constants = n_known_constants
+
+    cdef intp_t f_i = splitter.n_features
+    cdef intp_t f_j
+    cdef intp_t p
+    cdef intp_t p_prev
+    cdef intp_t left_span
+    cdef intp_t right_span
+
+    cdef intp_t wave_idx = -1
+    cdef intp_t dt = 0
+    cdef intp_t node_tp = splitter.node_time_index
+
+    cdef double penalized_improvement
+    cdef double current_gain
+    cdef double cand_impL, cand_impR, cand_impD
+    cdef double unpenalized_gain
+
+    _init_split(&best_split, end)
+    best_split.split_time_index = -1
+    partitioner.init_node_split(start, end)
+
+    while (f_i > n_total_constants and
+           (n_visited_features < max_features or
+            n_visited_features <= n_found_constants + n_drawn_constants)):
+
+        n_visited_features += 1
+
+        if f_i - n_found_constants <= n_drawn_constants:
+            break
+
+        f_j = rand_int(n_drawn_constants, f_i - n_found_constants,
+                       random_state)
+
+        if f_j < n_known_constants:
+            features[n_drawn_constants], features[f_j] = features[f_j], features[n_drawn_constants]
+            n_drawn_constants += 1
+            continue
+
+        f_j += n_found_constants
+        current_split.feature = features[f_j]
+        partitioner.sort_samples_and_feature_values(current_split.feature)
+        criterion.init_missing(partitioner.n_missing)
+
+        if partitioner.n_missing >= (end - start):
+            continue
+
+        if (end - start - partitioner.n_missing) < splitter.min_samples_leaf * 2:
+            continue
+
+        if feature_values[end - 1] <= feature_values[start] + FEATURE_THRESHOLD:
+            features[f_j], features[n_total_constants] = features[n_total_constants], features[f_j]
+            n_found_constants += 1
+            n_total_constants += 1
+            continue
+
+        f_i -= 1
+        features[f_i], features[f_j] = features[f_j], features[f_i]
+
+        for search_idx in range(2 if partitioner.n_missing != 0 else 1):
+            criterion.missing_go_to_left = (search_idx == 1 and partitioner.n_missing != 0)
+            criterion.init_missing(partitioner.n_missing)
+            criterion.reset()
+            p_prev = start - 1
+            p = start
+
+            while p < end:
+                partitioner.next_p(&p_prev, &p)
+                if p >= end:
+                    break
+
+                current_split.pos = p
+                current_split.n_missing = partitioner.n_missing
+
+                left_span = current_split.pos - start
+                right_span = end - current_split.pos
+                if partitioner.n_missing != 0:
+                    if criterion.missing_go_to_left:
+                        left_span -= partitioner.n_missing
+                    else:
+                        right_span -= partitioner.n_missing
+
+                if (left_span < splitter.min_samples_leaf or
+                        right_span < splitter.min_samples_leaf):
+                    continue
+
+                if splitter.check_presplit_conditions(&current_split, partitioner.n_missing, criterion.missing_go_to_left) == 1:
+                    continue
+
+                criterion.update(current_split.pos)
+
+                if splitter.check_postsplit_conditions() == 1:
+                    continue
+
+                criterion.children_impurity_three(&cand_impL, &cand_impR, &cand_impD)
+                if cand_impD == INFINITY or cand_impD == -INFINITY or isnan(cand_impD):
+                    cand_impD = 0.0
+                current_gain = criterion.impurity_improvement_ternary(impurity, cand_impL, cand_impR, cand_impD)
+
+                wave_idx = -1
+                with gil:
+                    if feature_index_map is not None:
+                        wave_idx = feature_index_map.get(current_split.feature, -1)
+
+                if wave_idx >= 0 and wave_idx < node_tp:
+                    continue
+
+                if wave_idx >= 0:
+                    dt = wave_idx - node_tp
+                    penalized_improvement = current_gain * exp(-threshold_gain * dt)
+                else:
+                    dt = 0
+                    penalized_improvement = current_gain
+
+                if penalized_improvement > best_penalized_gain:
+                    best_penalized_gain = penalized_improvement
+                    current_split.threshold = (feature_values[p_prev] / 2.0 + feature_values[p] / 2.0)
+                    if (current_split.threshold == feature_values[p] or
+                            current_split.threshold == INFINITY or
+                            current_split.threshold == -INFINITY):
+                        current_split.threshold = feature_values[p_prev]
+                    best_split = current_split
+                    best_split.split_time_index = wave_idx
+                    best_split.missing_go_to_left = criterion.missing_go_to_left
+                    best_split.impurity_left = cand_impL
+                    best_split.impurity_right = cand_impR
+                    best_split.impurity_duration = cand_impD
+                    best_split.improvement = current_gain
+
+                    if best_split.split_time_index < 0:
+                        best_split.split_time_index = node_tp
+
+    if best_penalized_gain == -INFINITY or best_split.pos >= end:
+        with gil:
+            splitter.last_best_gain = -INFINITY
+        return 1
+
+    partitioner.partition_samples_final(
+        best_split.pos,
+        best_split.threshold,
+        best_split.feature,
+        best_split.n_missing
+    )
+
+    criterion.reset()
+    criterion.update(best_split.pos)
+
+    unpenalized_gain = best_split.improvement
+    if unpenalized_gain <= 0.0:
+        with gil:
+            splitter.last_best_gain = -INFINITY
+        return 1
+
+    with gil:
+        splitter.last_best_gain = best_penalized_gain
+
+    # Respect invariant for constant features: the original order of
+    # element in features[:n_known_constants] must be preserved for sibling
+    # and child nodes
+    memcpy(&features[0], &splitter.constant_features[0], sizeof(intp_t) * n_known_constants)
+    memcpy(&splitter.constant_features[n_known_constants], &features[n_known_constants], sizeof(intp_t) * n_found_constants)
+
+    # Return values
+    parent_record.n_constant_features = n_total_constants
+    split[0] = best_split
+    return 0
 # Sort n-element arrays pointed to by feature_values and samples, simultaneously,
 # by the values in feature_values. Algorithm: Introsort (Musser, SP&E, 1997).
 cdef inline void sort(float32_t* feature_values, intp_t* samples, intp_t n) noexcept nogil:
@@ -1883,6 +2097,8 @@ cdef class LexicoRFSplitter(Splitter):
             self.feature_index_map
         )
 
+
+
 cdef class BestSparseSplitter(Splitter):
     """Splitter for finding the best split, using the sparse data."""
     cdef SparsePartitioner partitioner
@@ -1970,4 +2186,54 @@ cdef class RandomSparseSplitter(Splitter):
             self.criterion,
             split,
             parent_record,
+        )
+cdef class TpTSplitter(Splitter):
+    """Splitter for finding TpT splits on dense data.
+
+    Notes
+    -----
+    This Phase-1 TpT implementation currently assumes fully observed input
+    features during split search. Missing-value routing / duration-branch
+    handling is not yet supported for production use in this splitter.
+
+    TpT wrappers therefore force ``monotonic_cst=None`` and the TpT split
+    search should be treated as incompatible with monotonic constraints for
+    now.
+    """
+    cdef DensePartitioner partitioner
+
+    cdef int init(
+        self,
+        object X,
+        const float64_t[:, ::1] y,
+        const float64_t[:] sample_weight,
+        const unsigned char[::1] missing_values_in_feature_mask,
+        float64_t threshold_gain=0.0015,
+        dict feature_index_map=None,
+    ) except -1:
+        Splitter.init(self, X, y, sample_weight, missing_values_in_feature_mask, threshold_gain, feature_index_map)
+        self.partitioner = DensePartitioner(
+            X, self.samples, self.feature_values, missing_values_in_feature_mask
+        )
+        # TODO: node_time_index should be propagated from parent's split_time_index
+        # Currently hardcoded to 0 (always relative to root)
+        # Future enhancement: Receive from builder as parent_split_time_index parameter
+        self.node_time_index = 0
+        self.use_penalized_stop_gain = True
+        # if passing from builder
+        self.feature_index_map = feature_index_map
+
+    cdef int node_split(
+        self,
+        ParentInfo* parent_record,
+        SplitRecord* split
+    ) except -1 nogil:
+        return node_TpT_split(
+            self,
+            self.partitioner,
+            self.criterion,
+            parent_record,
+            split,
+            self.threshold_gain,
+            self.feature_index_map
         )
