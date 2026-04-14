@@ -34,12 +34,12 @@ with open("README.rst") as f:
     LONG_DESCRIPTION = f.read()
 MAINTAINER = "Simon Provost"
 MAINTAINER_EMAIL = "simon.gilbert.provost@gmail.com"
-URL = "https://simonprovost.github.io/scikit-longitudinal/"
+URL = "https://scikit-longitudinal.readthedocs.io"
 DOWNLOAD_URL = "https://pypi.org/project/scikit-lexicographical-trees/#files"
 LICENSE = "new BSD"
 PROJECT_URLS = {
     "Bug Tracker": "https://github.com/simonprovost/scikit-lexicographical-trees/issues",
-    "Documentation": "https://simonprovost.github.io/scikit-longitudinal/",
+    "Documentation": "https://scikit-longitudinal.readthedocs.io",
     "Source Code": "https://github.com/simonprovost/scikit-lexicographical-trees",
 }
 
