@@ -20,6 +20,7 @@ from sklearn.tree import (
     export_text,
     plot_tree,
 )
+from sklearn.tree._export import _MPLTreeExporter
 
 # toy sample
 X = [[-2, -1], [-1, -1], [-1, -2], [1, 1], [1, 2], [2, 1]]
@@ -509,6 +510,17 @@ def test_plot_tree_entropy(pyplot):
     assert nodes[2].get_text() == "True  "
     assert nodes[3].get_text() == "entropy = 0.0\nsamples = 3\nvalue = [0, 3]"
     assert nodes[4].get_text() == "  False"
+
+
+def test_plot_tree_standard_tree_not_detected_as_tpt(pyplot):
+    clf = DecisionTreeClassifier(
+        max_depth=3, min_samples_split=2, criterion="gini", random_state=2
+    )
+    clf.fit(X, y)
+
+    exporter = _MPLTreeExporter()
+
+    assert not exporter._is_tpt_tree(clf)
 
 
 @pytest.mark.parametrize("fontsize", [None, 10, 20])

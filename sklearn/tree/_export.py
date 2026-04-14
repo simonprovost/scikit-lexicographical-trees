@@ -638,20 +638,14 @@ class _MPLTreeExporter(_BaseTreeExporter):
         self.tpt_horizontal_spacing_scale = 2.0
         self.tpt_size_scale = 0.5  # Scale factor for node sizes and fonts in TpT
 
-    def _is_tpt_tree(self, tree):
-        """Detect if this is a TpT tree by checking for TpT-specific attributes."""
-        try:
-            # Check if tree has n_duration_samples property and if any node has duration samples
-            if hasattr(tree, 'n_duration_samples'):
-                duration_samples = tree.n_duration_samples
-                if duration_samples is not None and np.any(duration_samples > 0):
-                    return True
-            # Also check if split_time_index exists (TpT-specific attribute)
-            if hasattr(tree, 'split_time_index'):
-                return True
-        except (AttributeError, TypeError):
-            pass
-        return False
+    def _is_tpt_tree(self, decision_tree):
+        """Detect TpT trees from the fitted estimator configuration."""
+        splitter = getattr(decision_tree, "splitter", None)
+        if splitter == "TpT":
+            return True
+
+        splitter_cls = getattr(splitter, "__class__", None)
+        return getattr(splitter_cls, "__name__", None) == "TpTSplitter"
 
     def _collect_duration_nodes(self, tree):
         """Collect information about duration nodes (nodes with n_duration_samples > 0).
@@ -1280,7 +1274,7 @@ class _MPLTreeExporter(_BaseTreeExporter):
 
         # Detect if this is a TpT tree and initialize TpT-specific attributes
         tree_ = decision_tree.tree_
-        self.is_tpt = self._is_tpt_tree(tree_)
+        self.is_tpt = self._is_tpt_tree(decision_tree)
         if self.is_tpt:
             self.tree_time_indices = tree_.split_time_index
             self.tree_duration_samples = tree_.n_duration_samples
