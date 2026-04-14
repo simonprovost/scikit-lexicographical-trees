@@ -53,7 +53,7 @@ from sklearn.externals._packaging.version import parse as parse_version  # noqa
 
 
 # VERSION = sklearn.__version__
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 
 # Custom clean command to remove build artifacts
 

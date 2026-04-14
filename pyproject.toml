@@ -1,6 +1,6 @@
 [project]
 name = "scikit-lexicographical-trees"
-version = "0.0.4"
+version = "0.0.5"
 description = "A set of python modules for machine learning and data mining"
 readme = "README.rst"
 maintainers = [

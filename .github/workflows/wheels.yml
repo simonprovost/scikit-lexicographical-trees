@@ -43,37 +43,44 @@ jobs:
     if: needs.check_build_trigger.outputs.build
 
     strategy:
-      # Ensure that a wheel builder finishes even if another fails
       fail-fast: false
       matrix:
         include:
-          # Linux 64 bit manylinux2014
           - os: ubuntu-latest
             python: 39
             platform_id: manylinux_x86_64
             manylinux_image: manylinux2014
+            cibw_arch: x86_64
 
-          # NumPy on Python 3.10 only supports 64bit and is only available with manylinux2014
           - os: ubuntu-latest
             python: 310
             platform_id: manylinux_x86_64
             manylinux_image: manylinux2014
+            cibw_arch: x86_64
 
-          # MacOS x86_64
-          - os: macos-12
+          - os: macos-15
             python: 39
             platform_id: macosx_x86_64
-          - os: macos-12
+            cibw_arch: x86_64
+            miniforge_arch: x86_64
+
+          - os: macos-15
             python: 310
             platform_id: macosx_x86_64
+            cibw_arch: x86_64
+            miniforge_arch: x86_64
 
-          # MacOS arm64
-          - os: macos-14
+          - os: macos-15
             python: 39
             platform_id: macosx_arm64
-          - os: macos-14
+            cibw_arch: arm64
+            miniforge_arch: arm64
+
+          - os: macos-15
             python: 310
             platform_id: macosx_arm64
+            cibw_arch: arm64
+            miniforge_arch: arm64
 
     steps:
       - name: Checkout scikit-learn
@@ -82,35 +89,22 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9" # update once build dependencies are available
+          python-version: "3.11"
 
-      - name: Install conda for macos arm64
-        if: ${{ matrix.platform_id == 'macosx_arm64' }}
+      - name: Install conda for macOS
+        if: runner.os == 'macOS'
         run: |
-          set -ex
-          # macos arm64 runners do not have conda installed. Thus we much install conda manually
-          EXPECTED_SHA="dd832d8a65a861b5592b2cf1d55f26031f7c1491b30321754443931e7b1e6832"
-          MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/download/23.11.0-0/Mambaforge-23.11.0-0-MacOSX-arm64.sh"
-          curl -L --retry 10 $MINIFORGE_URL -o miniforge.sh
+          set -euxo pipefail
 
-          # Check SHA
-          file_sha=$(shasum -a 256 miniforge.sh | awk '{print $1}')
-          if [ "$EXPECTED_SHA" != "$file_sha" ]; then
-              echo "SHA values did not match!"
-              exit 1
-          fi
+          MINIFORGE_PATH="$HOME/miniforge"
+          MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-${{ matrix.miniforge_arch }}.sh"
+          curl -L --retry 10 "$MINIFORGE_URL" -o miniforge.sh
+          bash ./miniforge.sh -b -p "$MINIFORGE_PATH"
 
-          # Install miniforge
-          MINIFORGE_PATH=$HOME/miniforge
-          bash ./miniforge.sh -b -p $MINIFORGE_PATH
-          echo "$MINIFORGE_PATH/bin" >> $GITHUB_PATH
-          echo "CONDA_HOME=$MINIFORGE_PATH" >> $GITHUB_ENV
+          echo "$MINIFORGE_PATH/bin" >> "$GITHUB_PATH"
+          echo "CONDA_HOME=$MINIFORGE_PATH" >> "$GITHUB_ENV"
 
-      - name: Set conda environment for non-macos arm64 environments
-        if: ${{ matrix.platform_id != 'macosx_arm64' }}
-        run: |
-          # Non-macos arm64 envrionments already have conda installed
-          echo "CONDA_HOME=/usr/local/miniconda" >> $GITHUB_ENV
+          sudo ln -sf "$MINIFORGE_PATH/bin/conda" /usr/local/bin/conda
 
       - name: 👀Build and test wheels
         env:
@@ -118,7 +112,7 @@ jobs:
           CIBW_ENVIRONMENT: SKLEARN_SKIP_NETWORK_TESTS=1
             SKLEARN_BUILD_PARALLEL=3
           CIBW_BUILD: cp${{ matrix.python }}-${{ matrix.platform_id }}
-          CIBW_ARCHS: all
+          CIBW_ARCHS: ${{ matrix.cibw_arch }}
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.manylinux_image }}
           CIBW_MANYLINUX_I686_IMAGE: ${{ matrix.manylinux_image }}
           CIBW_BUILD_VERBOSITY: 1
@@ -130,7 +124,6 @@ jobs:
         with:
           name: cibw-wheels-cp${{ matrix.python }}-${{ matrix.platform_id }}
           path: wheelhouse/*.whl
-
   # Build the source distribution under Linux
   build_sdist:
     name: ⚙️ Source distribution
@@ -145,7 +138,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9" # update once build dependencies are available
+          python-version: "3.11"
 
       - name: Build source distribution
         run: bash build_tools/github/build_source.sh
@@ -181,5 +174,3 @@ jobs:
 
       - name: Publish distribution 📦 to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_PASSWORD }}
