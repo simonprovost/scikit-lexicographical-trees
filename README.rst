@@ -3,7 +3,7 @@ Scikit-lexicographical-trees
 
 **Scikit-lexicographical-trees** is an adaptation of the Scikit-Learn trees module to support lexicographical approaches
 for longitudinal data. Refer to the following document for further information:
-`Lexico Decision Tree Classifier <https://simonprovost.github.io/scikit-longitudinal/API/estimators/trees/lexico_decision_tree_classifier/>`_.
+`Lexico Decision Tree Classifier <https://scikit-longitudinal.readthedocs.io/latest//API/estimators/trees/lexico_decision_tree_classifier>`_.
 
 Classifiers and regressors supporting lexicographical approaches:
 
@@ -11,8 +11,14 @@ Classifiers and regressors supporting lexicographical approaches:
 🌲 Random Forest Classifier
 🌲 Decision Tree Regressor
 
+Classifiers and regressors supporting time-penalized approaches:
+
+🌲 Decision Tree Classifier
+🌲 Random Forest Classifier
+🌲 Decision Tree Regressor
+
 For more information, refer to the Scikit-Longitudinal
-– main library utilizing the current fork – : `Scikit-Longitudinal <https://simonprovost.github.io/scikit-longitudinal>`_.
+– main library utilizing the current fork – : `Scikit-Longitudinal <https://scikit-longitudinal.readthedocs.io/latest/>`_.
 
 Acknowledgements
 ----------------

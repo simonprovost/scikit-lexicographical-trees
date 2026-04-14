@@ -500,6 +500,7 @@ cdef inline intp_t node_split_best(
     cdef intp_t n_total_constants = n_known_constants
 
     _init_split(&best_split, end)
+    _init_split(&current_split, end)
 
     partitioner.init_node_split(start, end)
 
@@ -752,6 +753,7 @@ cdef inline int node_lexicoRF_split(
     cdef intp_t best_feature_in_group = 0
 
     _init_split(&best_split, end)
+    _init_split(&current_split, end)
     partitioner.init_node_split(start, end)
 
     # Sample up to max_features without replacement using a
@@ -952,6 +954,7 @@ cdef inline int node_TpT_split(
     cdef double unpenalized_gain
 
     _init_split(&best_split, end)
+    _init_split(&current_split, end)
     best_split.split_time_index = -1
     partitioner.init_node_split(start, end)
 
@@ -1260,6 +1263,7 @@ cdef inline int node_split_random(
     cdef float32_t max_feature_value
 
     _init_split(&best_split, end)
+    _init_split(&current_split, end)
 
     partitioner.init_node_split(start, end)
 

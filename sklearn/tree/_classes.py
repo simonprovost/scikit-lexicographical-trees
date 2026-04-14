@@ -163,8 +163,8 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
         self.store_leaf_values = store_leaf_values
         self.monotonic_cst = monotonic_cst
         self.threshold_gain = threshold_gain
-        self.feature_index_map = {}
         self.features_group = features_group
+        self._feature_index_map = None
 
     def get_depth(self):
         """Return the depth of the decision tree.
@@ -240,8 +240,9 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
 
     def _update_feature_index_map(self):
         if self.features_group is None:
+            self._feature_index_map = None
             return
-        self.feature_index_map = {
+        self._feature_index_map = {
             feature: time_index
             for group in self.features_group
             for time_index, feature in enumerate(group)
@@ -545,7 +546,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 random_state,
                 monotonic_cst,
                 self.threshold_gain,
-                self.feature_index_map,
+                self._feature_index_map,
             )
 
         if is_classifier(self):
@@ -569,7 +570,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 min_impurity_decrease=self.min_impurity_decrease,
                 store_leaf_values=self.store_leaf_values,
                 threshold_gain=self.threshold_gain,
-                feature_index_map=self.feature_index_map,
+                feature_index_map=self._feature_index_map,
             )
         else:
             builder = BestFirstTreeBuilder(
@@ -582,9 +583,17 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 min_impurity_decrease=self.min_impurity_decrease,
                 store_leaf_values=self.store_leaf_values,
                 threshold_gain=self.threshold_gain,
-                feature_index_map=self.feature_index_map,
+                feature_index_map=self._feature_index_map,
             )
-        builder.build(self.tree_, X, y, sample_weight, missing_values_in_feature_mask, self.threshold_gain, self.feature_index_map)
+        builder.build(
+            self.tree_,
+            X,
+            y,
+            sample_weight,
+            missing_values_in_feature_mask,
+            self.threshold_gain,
+            self._feature_index_map,
+        )
 
         if self.n_outputs_ == 1 and is_classifier(self):
             self.n_classes_ = self.n_classes_[0]
@@ -633,7 +642,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
             random_state,
             monotonic_cst,
             self.threshold_gain,
-            self.feature_index_map,
+            self._feature_index_map,
         )
 
         # Use BestFirst if max_leaf_nodes given; use DepthFirst otherwise
@@ -647,7 +656,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 min_impurity_decrease=self.min_impurity_decrease,
                 store_leaf_values=self.store_leaf_values,
                 threshold_gain=self.threshold_gain,
-                feature_index_map=self.feature_index_map,
+                feature_index_map=self._feature_index_map,
             )
         else:
             builder = BestFirstTreeBuilder(
@@ -660,7 +669,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 min_impurity_decrease=self.min_impurity_decrease,
                 store_leaf_values=self.store_leaf_values,
                 threshold_gain=self.threshold_gain,
-                feature_index_map=self.feature_index_map,
+                feature_index_map=self._feature_index_map,
             )
         builder.initialize_node_queue(self.tree_, X, y, sample_weight)
         builder.build(self.tree_, X, y, sample_weight)
@@ -2183,6 +2192,12 @@ class ExtraTreeClassifier(DecisionTreeClassifier):
     0.8947...
     """
 
+    _parameter_constraints: dict = {
+        **DecisionTreeClassifier._parameter_constraints,
+    }
+    _parameter_constraints.pop("threshold_gain")
+    _parameter_constraints.pop("features_group")
+
     def __init__(
         self,
         *,
@@ -2452,6 +2467,12 @@ class ExtraTreeRegressor(DecisionTreeRegressor):
     >>> reg.score(X_test, y_test)
     0.33...
     """
+
+    _parameter_constraints: dict = {
+        **DecisionTreeRegressor._parameter_constraints,
+    }
+    _parameter_constraints.pop("threshold_gain")
+    _parameter_constraints.pop("features_group")
 
     def __init__(
         self,
